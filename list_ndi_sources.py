@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from ffmpeg_cmd import ndi_demuxer_supports_extra_ips
+
 
 def main() -> None:
     ff = Path(os.environ.get("FFMPEG_PATH", r"C:\ffmpeg\bin\ffmpeg.exe"))
@@ -17,7 +19,7 @@ def main() -> None:
             ff = Path(w)
     ips = os.environ.get("NDI_EXTRA_IPS", "").strip()
     args = [str(ff), "-hide_banner", "-f", "libndi_newtek"]
-    if ips:
+    if ips and ndi_demuxer_supports_extra_ips(str(ff)):
         args += ["-extra_ips", ips]
     args += ["-find_sources", "1", "-i", "dummy"]
     r = subprocess.run(args)

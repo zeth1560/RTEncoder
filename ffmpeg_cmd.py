@@ -4,9 +4,27 @@ Build ffmpeg argument lists for NDI → rolling HLS buffer and long recordings.
 
 from __future__ import annotations
 
+import subprocess
+from functools import lru_cache
 from pathlib import Path
 
 from settings import EncoderSettings
+
+
+@lru_cache(maxsize=16)
+def ndi_demuxer_supports_extra_ips(ffmpeg: str) -> bool:
+    """True if `ffmpeg -h demuxer=libndi_newtek` documents extra_ips (not all NDI builds do)."""
+    try:
+        r = subprocess.run(
+            [ffmpeg, "-hide_banner", "-h", "demuxer=libndi_newtek"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        out = ((r.stdout or "") + (r.stderr or "")).lower()
+        return "extra_ips" in out
+    except (OSError, subprocess.TimeoutExpired):
+        return False
 
 
 def ndi_input_args(s: EncoderSettings) -> list[str]:
@@ -14,7 +32,7 @@ def ndi_input_args(s: EncoderSettings) -> list[str]:
         raise ValueError("NDI_SOURCE_NAME is required (exact NDI source name).")
     args: list[str] = ["-hide_banner", "-loglevel", "info", "-y"]
     args += ["-f", "libndi_newtek"]
-    if s.ndi_extra_ips.strip():
+    if s.ndi_extra_ips.strip() and ndi_demuxer_supports_extra_ips(str(s.ffmpeg_path)):
         args += ["-extra_ips", s.ndi_extra_ips.strip()]
     args += ["-i", s.ndi_source_name.strip()]
     return args

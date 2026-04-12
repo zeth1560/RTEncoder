@@ -420,9 +420,20 @@ class OperatorApp:
             btns, text="Stop long recording", command=self.request_stop_long
         )
         self.btn_stop_long.pack(side=tk.LEFT, padx=2)
+        self.btn_copy_log = tk.Button(btns, text="Copy log", command=self._copy_log_to_clipboard)
+        self.btn_copy_log.pack(side=tk.LEFT, padx=2)
 
-        self.log_widget = scrolledtext.ScrolledText(root, height=20, state=tk.DISABLED)
+        self.log_widget = scrolledtext.ScrolledText(
+            root,
+            height=20,
+            state=tk.NORMAL,
+            font=("Consolas", 9),
+            wrap=tk.WORD,
+        )
         self.log_widget.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
+        self.log_widget.bind("<Key>", self._log_readonly_key)
+        self.log_widget.bind("<<Paste>>", lambda e: "break")
+        self.log_widget.bind("<Button-1>", self._log_focus_on_click)
 
         hk_line = (
             f"{_pretty_hotkey_combo(settings.hotkey_save_replay)} → Save instant replay | "
@@ -665,11 +676,43 @@ class OperatorApp:
         self._last_error_ts = dt.datetime.now().strftime("%H:%M:%S")
         self._last_error_msg = f"buffer exit {code}"
 
+    def _log_readonly_key(self, event: tk.Event) -> str | None:
+        """Block edits; allow navigation and Ctrl+C / Ctrl+A / Ctrl+Insert."""
+        ctrl = (event.state & 0x4) != 0
+        keysym = event.keysym
+        if ctrl and keysym.lower() in ("c", "a", "insert"):
+            return None
+        if keysym in (
+            "Left",
+            "Right",
+            "Up",
+            "Down",
+            "Home",
+            "End",
+            "Prior",
+            "Next",
+            "Shift_L",
+            "Shift_R",
+            "Control_L",
+            "Control_R",
+            "Alt_L",
+            "Alt_R",
+        ):
+            return None
+        return "break"
+
+    def _log_focus_on_click(self, event: tk.Event) -> None:
+        self.log_widget.focus_set()
+
+    def _copy_log_to_clipboard(self) -> None:
+        text = self.log_widget.get("1.0", tk.END)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text.rstrip("\n"))
+        self.root.update_idletasks()
+
     def _append_log(self, text: str) -> None:
-        self.log_widget.configure(state=tk.NORMAL)
         self.log_widget.insert(tk.END, text)
         self.log_widget.see(tk.END)
-        self.log_widget.configure(state=tk.DISABLED)
 
     def _poll_log(self) -> None:
         try:

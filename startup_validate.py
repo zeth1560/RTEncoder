@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from ffmpeg_cmd import ndi_demuxer_supports_extra_ips
 from settings import EncoderSettings
 
 
@@ -37,11 +38,18 @@ def _ffmpeg_has_ndi(ffmpeg: Path) -> tuple[bool, str]:
             timeout=15,
         )
         out = (r.stdout or "") + (r.stderr or "")
-        if r.returncode == 0 and "libndi_newtek" in out.lower():
-            return True, "libndi_newtek demuxer present"
-        if "libndi_newtek" in out.lower():
-            return True, "libndi_newtek referenced in help output"
-        return False, "libndi_newtek demuxer not found (build ffmpeg with NDI support)"
+        low = out.lower()
+        # Require exit 0 only: stderr can still mention the name on "Unknown demuxer" (false positive).
+        if r.returncode != 0:
+            return False, (
+                "libndi_newtek demuxer not found (ffmpeg exited "
+                f"{r.returncode}; use an FFmpeg build compiled with NDI / libndi_newtek)"
+            )
+        if "unknown" in low and "demuxer" in low:
+            return False, "libndi_newtek demuxer not found (help text reports unknown demuxer)"
+        if "libndi_newtek" not in low:
+            return False, "libndi_newtek demuxer not found (no demuxer help for libndi_newtek)"
+        return True, "libndi_newtek demuxer present"
     except OSError as e:
         return False, f"NDI demuxer check failed: {e}"
     except subprocess.TimeoutExpired:
@@ -60,7 +68,7 @@ def _probe_ndi_open(s: EncoderSettings, timeout_sec: float = 12.0) -> tuple[bool
         "-f",
         "libndi_newtek",
     ]
-    if s.ndi_extra_ips.strip():
+    if s.ndi_extra_ips.strip() and ndi_demuxer_supports_extra_ips(str(s.ffmpeg_path)):
         args += ["-extra_ips", s.ndi_extra_ips.strip()]
     args += [
         "-i",
@@ -124,6 +132,13 @@ def validate_startup(s: EncoderSettings) -> tuple[list[str], list[str]]:
 
     if not s.ndi_source_name.strip():
         errors.append("NDI_SOURCE_NAME is empty")
+
+    if s.ndi_extra_ips.strip() and not ndi_demuxer_supports_extra_ips(str(s.ffmpeg_path)):
+        warnings.append(
+            "NDI_EXTRA_IPS is ignored: this ffmpeg build has no libndi_newtek extra_ips option "
+            "(mDNS discovery only). Unset NDI_EXTRA_IPS or use a build where "
+            "`ffmpeg -h demuxer=libndi_newtek` lists extra_ips."
+        )
 
     if not errors and s.ndi_source_name.strip():
         ok, msg = _probe_ndi_open(s)
