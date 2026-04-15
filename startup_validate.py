@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from ffmpeg_cmd import ndi_demuxer_supports_extra_ips
+from ffmpeg_cmd import uvc_probe_decode_args
 from settings import EncoderSettings
 
 
@@ -29,54 +29,12 @@ def _run_ffmpeg_version(ffmpeg: Path) -> tuple[bool, str]:
         return False, "ffmpeg -version timed out"
 
 
-def _ffmpeg_has_ndi(ffmpeg: Path) -> tuple[bool, str]:
+def _probe_uvc_open(s: EncoderSettings, timeout_sec: float = 15.0) -> tuple[bool, str]:
+    """Try to open the configured UVC path briefly (decode a few video frames)."""
     try:
-        r = subprocess.run(
-            [str(ffmpeg), "-hide_banner", "-h", "demuxer=libndi_newtek"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-        out = (r.stdout or "") + (r.stderr or "")
-        low = out.lower()
-        # Require exit 0 only: stderr can still mention the name on "Unknown demuxer" (false positive).
-        if r.returncode != 0:
-            return False, (
-                "libndi_newtek demuxer not found (ffmpeg exited "
-                f"{r.returncode}; use an FFmpeg build compiled with NDI / libndi_newtek)"
-            )
-        if "unknown" in low and "demuxer" in low:
-            return False, "libndi_newtek demuxer not found (help text reports unknown demuxer)"
-        if "libndi_newtek" not in low:
-            return False, "libndi_newtek demuxer not found (no demuxer help for libndi_newtek)"
-        return True, "libndi_newtek demuxer present"
-    except OSError as e:
-        return False, f"NDI demuxer check failed: {e}"
-    except subprocess.TimeoutExpired:
-        return False, "NDI demuxer check timed out"
-
-
-def _probe_ndi_open(s: EncoderSettings, timeout_sec: float = 12.0) -> tuple[bool, str]:
-    """Try to open the configured NDI source briefly (decode a few frames)."""
-    args = [
-        str(s.ffmpeg_path),
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-t",
-        "0.5",
-        "-f",
-        "libndi_newtek",
-    ]
-    if s.ndi_extra_ips.strip() and ndi_demuxer_supports_extra_ips(str(s.ffmpeg_path)):
-        args += ["-extra_ips", s.ndi_extra_ips.strip()]
-    args += [
-        "-i",
-        s.ndi_source_name.strip(),
-        "-f",
-        "null",
-        "-",
-    ]
+        args = [str(s.ffmpeg_path)] + uvc_probe_decode_args(s)
+    except ValueError as e:
+        return False, str(e)
     try:
         r = subprocess.run(
             args,
@@ -86,13 +44,13 @@ def _probe_ndi_open(s: EncoderSettings, timeout_sec: float = 12.0) -> tuple[bool
         )
         err = (r.stderr or "").strip()
         if r.returncode == 0:
-            return True, "NDI source opened (short probe ok)"
+            return True, "UVC source opened (short probe ok)"
         tail = err[-1200:] if err else "(no stderr)"
-        return False, f"NDI probe failed (exit {r.returncode}): {tail}"
+        return False, f"UVC probe failed (exit {r.returncode}): {tail}"
     except subprocess.TimeoutExpired:
-        return False, "NDI probe timed out"
+        return False, "UVC probe timed out"
     except OSError as e:
-        return False, f"NDI probe could not run: {e}"
+        return False, f"UVC probe could not run: {e}"
 
 
 def _dir_writable(d: Path) -> tuple[bool, str]:
@@ -123,25 +81,11 @@ def validate_startup(s: EncoderSettings) -> tuple[list[str], list[str]]:
         else:
             warnings.append(msg)
 
-    if not errors:
-        ok, msg = _ffmpeg_has_ndi(s.ffmpeg_path)
-        if not ok:
-            errors.append(msg)
-        else:
-            warnings.append(msg)
+    if not s.uvc_video_device.strip():
+        errors.append("UVC_VIDEO_DEVICE is empty")
 
-    if not s.ndi_source_name.strip():
-        errors.append("NDI_SOURCE_NAME is empty")
-
-    if s.ndi_extra_ips.strip() and not ndi_demuxer_supports_extra_ips(str(s.ffmpeg_path)):
-        warnings.append(
-            "NDI_EXTRA_IPS is ignored: this ffmpeg build has no libndi_newtek extra_ips option "
-            "(mDNS discovery only). Unset NDI_EXTRA_IPS or use a build where "
-            "`ffmpeg -h demuxer=libndi_newtek` lists extra_ips."
-        )
-
-    if not errors and s.ndi_source_name.strip():
-        ok, msg = _probe_ndi_open(s)
+    if not errors and s.uvc_video_device.strip():
+        ok, msg = _probe_uvc_open(s)
         if not ok:
             errors.append(msg)
         else:

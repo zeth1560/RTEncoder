@@ -1,4 +1,4 @@
-"""Print available NDI sources (requires ffmpeg with libndi_newtek)."""
+"""Print UVC / capture devices (DirectShow on Windows, v4l2 on Linux)."""
 
 from __future__ import annotations
 
@@ -8,20 +8,22 @@ import subprocess
 import sys
 from pathlib import Path
 
-from ffmpeg_cmd import ndi_demuxer_supports_extra_ips
+from settings import load_dotenv_if_present
 
 
 def main() -> None:
+    load_dotenv_if_present()
     ff = Path(os.environ.get("FFMPEG_PATH", r"C:\ffmpeg\bin\ffmpeg.exe"))
     if not ff.exists():
         w = shutil.which("ffmpeg")
         if w:
             ff = Path(w)
-    ips = os.environ.get("NDI_EXTRA_IPS", "").strip()
-    args = [str(ff), "-hide_banner", "-f", "libndi_newtek"]
-    if ips and ndi_demuxer_supports_extra_ips(str(ff)):
-        args += ["-extra_ips", ips]
-    args += ["-find_sources", "1", "-i", "dummy"]
+
+    if sys.platform == "win32":
+        args = [str(ff), "-hide_banner", "-f", "dshow", "-list_devices", "true", "-i", "dummy"]
+    else:
+        args = [str(ff), "-hide_banner", "-f", "v4l2", "-list_devices", "true", "-i", "dummy"]
+
     r = subprocess.run(args)
     sys.exit(r.returncode)
 
