@@ -18,6 +18,8 @@ def register_global_hotkeys_win(
     bindings: list[tuple[str, Callable[[], None]]],
     *,
     on_done: Callable[[], None] | None = None,
+    on_registered: Callable[[str], None] | None = None,
+    on_registration_failed: Callable[[str, str], None] | None = None,
 ) -> None:
     """
     Register each ``(combo, handler)`` in a short-lived background thread.
@@ -39,8 +41,20 @@ def register_global_hotkeys_win(
         try:
             for combo, handler in bindings:
                 c = combo.strip().lower()
-                keyboard.add_hotkey(c, make_hook(handler))
-                logger.info("Registered global hotkey: %s", c)
+                try:
+                    keyboard.add_hotkey(c, make_hook(handler))
+                    logger.info("Registered global hotkey: %s", c)
+                    if on_registered:
+                        root.after(0, lambda combo_name=c: on_registered(combo_name))
+                except Exception as e:
+                    logger.exception("Failed to register global hotkey: %s", c)
+                    if on_registration_failed:
+                        root.after(
+                            0,
+                            lambda combo_name=c, err=str(e): on_registration_failed(
+                                combo_name, err
+                            ),
+                        )
         except Exception:
             logger.exception("Failed to register global hotkeys")
         if on_done:

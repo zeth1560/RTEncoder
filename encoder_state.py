@@ -22,7 +22,7 @@ import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 SCHEMA_VERSION = 1
 
@@ -37,7 +37,12 @@ STATE_BLOCKED = "blocked"
 STATE_SHUTTING_DOWN = "shutting_down"
 
 
-def publish_encoder_state(path: Path, payload: dict[str, Any]) -> None:
+def publish_encoder_state(
+    path: Path,
+    payload: dict[str, Any],
+    *,
+    on_written: Callable[[Path, dict[str, Any]], None] | None = None,
+) -> None:
     """Write JSON atomically (temp + os.replace)."""
     path = path.resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -48,3 +53,5 @@ def publish_encoder_state(path: Path, payload: dict[str, Any]) -> None:
     text = json.dumps(out, indent=2, sort_keys=False) + "\n"
     tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)
+    if on_written is not None:
+        on_written(path, out)

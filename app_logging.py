@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import queue
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -50,6 +51,22 @@ def setup_encoder_logging(
     fh.setFormatter(fmt)
     root.addHandler(fh)
 
+    json_logger = logging.getLogger("replaytrove.encoder.jsonl")
+    json_logger.setLevel(logging.INFO)
+    json_logger.handlers.clear()
+    json_logger.propagate = False
+
+    json_file = log_file.with_suffix(".jsonl")
+    jh = RotatingFileHandler(
+        json_file,
+        maxBytes=max_bytes,
+        backupCount=backup_count,
+        encoding="utf-8",
+    )
+    jh.setLevel(logging.INFO)
+    jh.setFormatter(logging.Formatter("%(message)s"))
+    json_logger.addHandler(jh)
+
     if ui_queue is not None:
         qh = TkQueueLogHandler(ui_queue)
         qh.setLevel(logging.INFO)
@@ -57,3 +74,7 @@ def setup_encoder_logging(
         root.addHandler(qh)
 
     return root
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
