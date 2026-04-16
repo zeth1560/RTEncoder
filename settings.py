@@ -92,6 +92,15 @@ class EncoderSettings:
     long_output_height: int
     long_output_fps: int
     long_record_max_seconds: int
+    long_record_rtbufsize: str
+    long_record_input_fps: str
+    long_record_output_fps: str
+    long_record_video_codec: str
+    long_record_video_preset: str
+    long_record_video_crf: int
+    long_record_pix_fmt: str
+    long_record_audio_codec: str
+    long_record_audio_bitrate: str
     encoder_state_path: Path
     encoder_self_restart_enabled: bool
     encoder_max_auto_restarts_before_app_restart: int
@@ -148,8 +157,11 @@ def load_encoder_settings() -> EncoderSettings:
     return EncoderSettings(
         ffmpeg_path=ff,
         uvc_capture_backend=uvc_backend,
-        uvc_video_device=_opt("UVC_VIDEO_DEVICE", ""),
-        uvc_audio_device=_opt("UVC_AUDIO_DEVICE", ""),
+        uvc_video_device=_opt("UVC_VIDEO_DEVICE", "USB3.0 HD Video Capture"),
+        uvc_audio_device=_opt(
+            "UVC_AUDIO_DEVICE",
+            "Microphone (USB3.0 HD Audio Capture)",
+        ),
         uvc_rtbufsize=_opt("UVC_DSHOW_RTBUFSIZE", ""),
         uvc_dshow_video_size=_opt("UVC_DSHOW_VIDEO_SIZE", ""),
         uvc_dshow_framerate=_opt_int("UVC_DSHOW_FRAMERATE", 0, 0),
@@ -197,6 +209,15 @@ def load_encoder_settings() -> EncoderSettings:
         long_output_height=_opt_int("LONG_OUTPUT_HEIGHT", 1080, 16),
         long_output_fps=_opt_int("LONG_OUTPUT_FPS", 30, 1),
         long_record_max_seconds=_opt_int("LONG_RECORD_MAX_SECONDS", 1200, 1),
+        long_record_rtbufsize=_opt("LONG_RECORD_RTBUFSIZE", "512M"),
+        long_record_input_fps=_opt("LONG_RECORD_INPUT_FRAMERATE", "30"),
+        long_record_output_fps=_opt("LONG_RECORD_OUTPUT_FRAMERATE", "30"),
+        long_record_video_codec=_opt("LONG_RECORD_VIDEO_CODEC", "libx264"),
+        long_record_video_preset=_opt("LONG_RECORD_VIDEO_PRESET", "superfast"),
+        long_record_video_crf=_opt_int("LONG_RECORD_VIDEO_CRF", 23, 0),
+        long_record_pix_fmt=_opt("LONG_RECORD_PIX_FMT", "yuv420p"),
+        long_record_audio_codec=_opt("LONG_RECORD_AUDIO_CODEC", "aac"),
+        long_record_audio_bitrate=_opt("LONG_RECORD_AUDIO_BITRATE", "128k"),
         encoder_state_path=Path(
             _opt(
                 "ENCODER_STATE_PATH",

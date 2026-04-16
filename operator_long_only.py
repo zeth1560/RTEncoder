@@ -18,13 +18,12 @@ import sys
 import threading
 import time
 import tkinter as tk
-import uuid
 from collections import deque
 from pathlib import Path
 from tkinter import messagebox, scrolledtext
-from typing import Any, Callable
+from typing import Any
 
-from app_logging import setup_encoder_logging, utc_now_iso
+from app_logging import setup_encoder_logging
 from encoder_state import (
     STATE_BLOCKED,
     STATE_READY,
@@ -33,60 +32,34 @@ from encoder_state import (
     STATE_UNAVAILABLE,
     publish_encoder_state,
 )
-from ffmpeg_cmd import long_record_args
+from ffmpeg_cmd import long_record_args, long_record_config_messages
+from flight_recorder import (
+    FlightJsonlEmitter,
+    ffprobe_video_report,
+    new_encoder_run_id,
+    parse_ffmpeg_input_stream,
+    redact_argv,
+    resolve_ffprobe_path,
+)
 from settings import EncoderSettings, load_encoder_settings
-from startup_validate import validate_startup
+from startup_validate import validate_startup_detailed
+from subprocess_win import no_console_creationflags
 
 logger = logging.getLogger("replaytrove.encoder")
-json_logger = logging.getLogger("replaytrove.encoder.jsonl")
 
-
-class StructuredEventEmitter:
-    def __init__(
-        self,
-        *,
-        run_id: str,
-        mode: str,
-        state_provider: Callable[[], dict[str, Any]],
-    ) -> None:
-        self.run_id = run_id
-        self.mode = mode
-        self._state_provider = state_provider
-
-    def emit(
-        self,
-        event: str,
-        *,
-        component: str,
-        message: str,
-        level: str = "INFO",
-        data: dict[str, Any] | None = None,
-    ) -> None:
-        payload: dict[str, Any] = {
-            "ts": utc_now_iso(),
-            "level": level.upper(),
-            "logger": "replaytrove.encoder",
-            "event": event,
-            "run_id": self.run_id,
-            "component": component,
-            "mode": self.mode,
-            "message": message,
-            "state": self._state_provider(),
-        }
-        if data:
-            payload.update(data)
-        json_logger.info(json.dumps(payload, ensure_ascii=True))
+# Encoder state constant -> flight-recorder app_state string
+STATE_TO_APP: dict[str, str] = {
+    "starting": "starting",
+    STATE_BLOCKED: "blocked",
+    STATE_READY: "ready",
+    STATE_RECORDING: "recording",
+    STATE_UNAVAILABLE: "unavailable",
+    STATE_SHUTTING_DOWN: "shutting_down",
+}
 
 
 def _pretty_hotkey_combo(combo: str) -> str:
     return "+".join(p.strip().capitalize() for p in combo.split("+"))
-
-
-def _touch(path: Path | None) -> None:
-    if path is None:
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.touch(exist_ok=True)
 
 
 def _flush_logger_handlers() -> None:
@@ -98,6 +71,31 @@ def _flush_logger_handlers() -> None:
             pass
 
 
+def _state_payload_signature(payload: dict[str, Any]) -> str:
+    trimmed = {k: v for k, v in payload.items() if k != "updated_at"}
+    return json.dumps(trimmed, sort_keys=True, default=str)
+
+
+def _infer_transition_reason(prev: str | None, new: str) -> str:
+    if prev is None:
+        if new == "blocked":
+            return "startup_failed"
+        if new == "ready":
+            return "startup_complete"
+        return "initial"
+    if new == "ready" and prev == "starting":
+        return "startup_complete"
+    if new == "blocked":
+        return "startup_failed"
+    if new == "recording" and prev == "ready":
+        return "recording_started"
+    if new == "ready" and prev == "recording":
+        return "recording_stopped"
+    if new == "shutting_down":
+        return "shutdown"
+    return "state_update"
+
+
 class LongOnlyRecorder:
     _PROGRESS_RE = re.compile(
         r"fps=\s*(?P<fps>[0-9.]+).*?bitrate=\s*(?P<bitrate>[0-9.]+)kbits/s.*?speed=\s*(?P<speed>[0-9.]+)x"
@@ -107,7 +105,7 @@ class LongOnlyRecorder:
         self,
         settings: EncoderSettings,
         log_q: queue.Queue[str],
-        events: StructuredEventEmitter,
+        events: FlightJsonlEmitter,
     ) -> None:
         self.settings = settings
         self.log_q = log_q
@@ -119,13 +117,18 @@ class LongOnlyRecorder:
         self._intentional_stop = False
         self._start_monotonic: float | None = None
         self._stop_reason = "operator_request"
-        self._stop_method = "graceful_q"
+        self._stop_method: str = "graceful_q"
         self._last_fps: float | None = None
         self._last_speed: float | None = None
         self._last_bitrate_kbps: float | None = None
-        self._stderr_tail: deque[str] = deque(maxlen=50)
+        self._stderr_tail: deque[str] = deque(maxlen=80)
         self._input_opened = False
         self._output_opened = False
+        self._session_pid: int | None = None
+        self._last_completed_session_pid: int | None = None
+        self.last_record_fault: str = ""
+        self._last_exit_data: dict[str, Any] | None = None
+        self._stop_trigger_source: str = "operator"
 
     def _emit(self, msg: str) -> None:
         ts = dt.datetime.now().strftime("%H:%M:%S")
@@ -153,12 +156,15 @@ class LongOnlyRecorder:
     def running(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
 
-    def start(self) -> bool:
-        self.stop()
+    def start(self, *, trigger_source: str) -> bool:
+        self.stop(reason="operator_request", stop_trigger_source="preempt_new_session")
+        self._session_pid = None
+        self._last_completed_session_pid = None
+        self._last_exit_data = None
         self.events.emit(
             "LONG_RECORD_START_REQUESTED",
-            component="recorder",
             message="Long recording start requested.",
+            data={"trigger_source": trigger_source},
         )
         ts = dt.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
         out = self.settings.long_clips_folder / f"{ts}.mkv"
@@ -166,20 +172,30 @@ class LongOnlyRecorder:
             args = [str(self.settings.ffmpeg_path)] + long_record_args(self.settings, out)
         except ValueError as e:
             self._emit(f"Long record config error: {e}")
+            self.last_record_fault = str(e)
             self.events.emit(
                 "LONG_RECORD_FAILED",
-                component="recorder",
                 level="ERROR",
                 message="Long record config error.",
-                data={"error": str(e)},
+                data={
+                    "error": {"kind": "config_error", "detail": str(e)},
+                    "pid": None,
+                    "output_path": str(out),
+                    "stop_reason": "error",
+                    "stop_method": "graceful_q",
+                },
             )
             return False
 
-        self.events.emit(
-            "SOURCE_OPEN_REQUESTED",
-            component="ffmpeg",
-            message="Requesting ffmpeg to open UVC source.",
-            data={"output_path": str(out), "argv": args},
+        req_size = (
+            self.settings.uvc_dshow_video_size.strip()
+            if self.settings.uvc_capture_backend == "dshow"
+            else self.settings.uvc_v4l2_video_size.strip()
+        )
+        req_fps = (
+            float(self.settings.long_record_input_fps)
+            if self.settings.uvc_capture_backend == "dshow"
+            else float(self.settings.uvc_v4l2_framerate)
         )
         self._intentional_stop = False
         self._stop_reason = "operator_request"
@@ -190,6 +206,8 @@ class LongOnlyRecorder:
         self._stderr_tail.clear()
         self._input_opened = False
         self._output_opened = False
+        for line in long_record_config_messages(self.settings, out):
+            self._emit(line)
         try:
             self.proc = subprocess.Popen(
                 args,
@@ -197,56 +215,52 @@ class LongOnlyRecorder:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 text=False,
+                **no_console_creationflags(),
             )
         except OSError as e:
             self._emit(f"Failed to start long record: {e}")
-            self.events.emit(
-                "SOURCE_OPEN_FAILED",
-                component="ffmpeg",
-                level="ERROR",
-                message="Failed to launch ffmpeg process.",
-                data={"error": str(e)},
-            )
+            self.last_record_fault = str(e)
             self.events.emit(
                 "LONG_RECORD_FAILED",
-                component="recorder",
                 level="ERROR",
                 message="Long recording failed to start.",
-                data={"error": str(e)},
+                data={
+                    "error": {"kind": "spawn_failed", "detail": str(e)},
+                    "pid": None,
+                    "output_path": str(out),
+                    "stop_reason": "error",
+                    "stop_method": "graceful_q",
+                },
             )
             return False
 
         self.output_path = out
+        self._session_pid = self.proc.pid
         self._start_monotonic = time.monotonic()
         try:
             out.parent.mkdir(parents=True, exist_ok=True)
             out.touch(exist_ok=True)
-            self.events.emit(
-                "OUTPUT_FILE_CREATED",
-                component="recorder",
-                message="Output file path created.",
-                data={"output_path": str(out.resolve())},
-            )
         except OSError:
             pass
         self._emit(f"Long recording started (PID {self.proc.pid}) → {out}")
         self.events.emit(
             "LONG_RECORD_START_ACCEPTED",
-            component="recorder",
             message="Long recording request accepted.",
-            data={"output_path": str(out), "pid": self.proc.pid},
+            data={"output_path": str(out), "pid": self._session_pid, "trigger_source": trigger_source},
         )
+        argv_r = redact_argv(args)
         self.events.emit(
             "FFMPEG_CHILD_LAUNCHED",
-            component="ffmpeg",
             message="ffmpeg child launched.",
-            data={"pid": self.proc.pid, "output_path": str(out)},
-        )
-        self.events.emit(
-            "LONG_RECORD_STARTED",
-            component="recorder",
-            message="Long recording started.",
-            data={"output_path": str(out), "pid": self.proc.pid},
+            data={
+                "pid": self._session_pid,
+                "backend": self.settings.uvc_capture_backend,
+                "device_name": self.settings.uvc_video_device,
+                "requested_video_size": req_size or None,
+                "requested_fps": req_fps,
+                "output_path": str(out),
+                "argv_redacted": argv_r,
+            },
         )
         proc_ref = self.proc
 
@@ -264,25 +278,25 @@ class LongOnlyRecorder:
                     logger.debug("[long stderr] %s", line)
                 if not self._input_opened and "input #0" in low:
                     self._input_opened = True
-                    self.events.emit(
-                        "SOURCE_OPEN_SUCCEEDED",
-                        component="ffmpeg",
-                        message="ffmpeg opened input source.",
-                        data={"stderr_line": line},
-                    )
+                    blob = parse_ffmpeg_input_stream("\n".join(self._stderr_tail))
                     self.events.emit(
                         "FFMPEG_CHILD_STDERR_SUMMARY",
-                        component="ffmpeg",
-                        message="ffmpeg input initialized.",
-                        data={"summary_type": "input_opened", "stderr_line": line},
+                        message="ffmpeg input opened.",
+                        data={
+                            "phase": "input_opened",
+                            "input_format": blob.get("input_format"),
+                            "device_name": blob.get("device_name"),
+                            "detected_codec": blob.get("detected_codec"),
+                            "detected_resolution": blob.get("detected_resolution"),
+                            "detected_fps": blob.get("detected_fps"),
+                        },
                     )
                 if not self._output_opened and "output #0" in low:
                     self._output_opened = True
                     self.events.emit(
                         "FFMPEG_CHILD_STDERR_SUMMARY",
-                        component="ffmpeg",
                         message="ffmpeg output initialized.",
-                        data={"summary_type": "output_initialized", "stderr_line": line},
+                        data={"phase": "output_initialized", "stderr_line": line[:500]},
                     )
                 m = self._PROGRESS_RE.search(line)
                 if m:
@@ -294,58 +308,92 @@ class LongOnlyRecorder:
                         pass
 
         def reaper() -> None:
+            child_pid = proc_ref.pid
+            out_p = str(self.output_path) if self.output_path else None
             code = proc_ref.wait()
             self._emit(f"Long record ffmpeg ended (exit={code}).")
+            if code != 0:
+                self._stop_reason = "error"
+            elif not self._intentional_stop:
+                self._stop_reason = "auto_stop_max_duration"
+                self._stop_method = "graceful_q"
+
+            if code == 0:
+                self.last_record_fault = ""
+            else:
+                self.last_record_fault = f"ffmpeg exited {code}"
+
             data = {
                 "exit_code": code,
                 "stop_reason": self._stop_reason,
                 "stop_method": self._stop_method,
+                "pid": child_pid,
+                "output_path": out_p,
             }
             if code != 0:
-                data["fatal_stderr_tail"] = list(self._stderr_tail)[-20:]
+                tail_lines = list(self._stderr_tail)[-20:]
                 self.events.emit(
                     "FFMPEG_CHILD_STDERR_SUMMARY",
-                    component="ffmpeg",
                     level="ERROR",
-                    message="ffmpeg fatal stderr tail captured.",
-                    data={"summary_type": "fatal_stderr_tail", **data},
+                    message="ffmpeg fatal / error tail.",
+                    data={
+                        "phase": "fatal_error_tail",
+                        "stderr_tail": tail_lines,
+                        "error": {"kind": "ffmpeg_exit_error", "exit_code": code},
+                    },
                 )
                 self.events.emit(
                     "LONG_RECORD_FAILED",
-                    component="recorder",
                     level="ERROR",
                     message="Long recording process exited with error.",
                     data=data,
                 )
             self.events.emit(
                 "FFMPEG_CHILD_EXITED",
-                component="ffmpeg",
                 level="INFO" if code == 0 else "ERROR",
                 message="ffmpeg child exited.",
                 data=data,
             )
+            if out_p is not None:
+                self.events.emit(
+                    "OUTPUT_FILE_FINALIZED",
+                    message="Output file finalized.",
+                    data=data,
+                )
+            self._last_completed_session_pid = child_pid
+            self._last_exit_data = dict(data)
 
         self._stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
         self._stderr_thread.start()
         self._reaper_thread = threading.Thread(target=reaper, daemon=True)
         self._reaper_thread.start()
+        self.last_record_fault = ""
         return True
 
-    def stop(self, *, reason: str = "operator_request") -> None:
+    def stop(self, *, reason: str, stop_trigger_source: str = "operator") -> None:
         p = self.proc
         if p is None:
             return
+        self._stop_trigger_source = stop_trigger_source
+        stop_pid = p.pid
+        out_p = str(self.output_path) if self.output_path else None
         self.events.emit(
             "LONG_RECORD_STOP_REQUESTED",
-            component="recorder",
             message="Long recording stop requested.",
-            data={"stop_reason": reason},
+            data={
+                "trigger_source": stop_trigger_source,
+                "pid": stop_pid,
+                "output_path": out_p,
+            },
         )
         self.events.emit(
             "FFMPEG_CHILD_STOP_REQUESTED",
-            component="ffmpeg",
             message="ffmpeg child stop requested.",
-            data={"stop_reason": reason},
+            data={
+                "pid": stop_pid,
+                "output_path": out_p,
+                "intended_method": "graceful_q",
+            },
         )
         self._stop_reason = reason
         self._stop_method = "graceful_q"
@@ -367,19 +415,27 @@ class LongOnlyRecorder:
                 self._stop_method = "terminate"
                 self.events.emit(
                     "FFMPEG_CHILD_STOP_TERMINATED",
-                    component="ffmpeg",
                     level="WARNING",
                     message="ffmpeg child terminate sent after graceful timeout.",
-                    data={"stop_reason": reason},
+                    data={
+                        "stop_reason": reason,
+                        "stop_method": "terminate",
+                        "pid": stop_pid,
+                        "output_path": out_p,
+                    },
                 )
             except OSError:
                 pass
         else:
             self.events.emit(
                 "FFMPEG_CHILD_STOP_GRACEFUL",
-                component="ffmpeg",
                 message="ffmpeg child stopped via graceful q.",
-                data={"stop_reason": reason},
+                data={
+                    "stop_reason": reason,
+                    "stop_method": "graceful_q",
+                    "pid": stop_pid,
+                    "output_path": out_p,
+                },
             )
         t1 = time.monotonic()
         while p.poll() is None and (time.monotonic() - t1) < self.settings.ffmpeg_child_terminate_wait_seconds:
@@ -390,10 +446,14 @@ class LongOnlyRecorder:
                 self._stop_method = "kill"
                 self.events.emit(
                     "FFMPEG_CHILD_STOP_KILLED",
-                    component="ffmpeg",
                     level="ERROR",
                     message="ffmpeg child killed after terminate timeout.",
-                    data={"stop_reason": reason},
+                    data={
+                        "stop_reason": reason,
+                        "stop_method": "kill",
+                        "pid": stop_pid,
+                        "output_path": out_p,
+                    },
                 )
             except OSError:
                 pass
@@ -403,27 +463,7 @@ class LongOnlyRecorder:
         self.proc = None
         self._stderr_thread = None
         self._reaper_thread = None
-        if self.output_path is not None:
-            self.events.emit(
-                "LONG_RECORD_STOPPED",
-                component="recorder",
-                message="Long record stop completed.",
-                data={
-                    "output_path": str(self.output_path),
-                    "stop_reason": self._stop_reason,
-                    "stop_method": self._stop_method,
-                },
-            )
-            self.events.emit(
-                "OUTPUT_FILE_FINALIZED",
-                component="recorder",
-                message="Output file finalized.",
-                data={
-                    "output_path": str(self.output_path),
-                    "stop_reason": self._stop_reason,
-                    "stop_method": self._stop_method,
-                },
-            )
+        self._session_pid = None
         self._emit("Long record stop completed.")
 
 
@@ -439,27 +479,26 @@ class LongOnlyApp:
         self._degraded = False
         self._last_error = "—"
         self._app_state = "starting"
-        self._prev_state: str | None = None
-        self._last_health_emit_monotonic = 0.0
+        self._prev_app_state: str | None = None
+        self._transition_reason_override: str | None = None
+        self._last_health_check_mono = 0.0
         self._health_interval_seconds = 12.0
-        self._last_watchdog_emit_monotonic = 0.0
-        self._watchdog_interval_seconds = 5.0
+        self._last_health_unavailable_mono = 0.0
+        self._state_log_heartbeat_seconds = 45.0
+        self._last_state_log_sig: str | None = None
+        self._last_state_log_mono = 0.0
         self._last_record_size_bytes = 0
         self._last_record_size_change_monotonic = time.monotonic()
         self._max_duration_event_emitted = False
 
         setup_encoder_logging(settings.encoder_log_file, ui_queue=self.log_q)
-        self.events = StructuredEventEmitter(
+        self.events = FlightJsonlEmitter(
             run_id=run_id,
             mode="long_only",
             state_provider=self._state_for_event,
         )
         logger.info("Long-only operator starting")
-        self.events.emit(
-            "APP_START",
-            component="app",
-            message="Long-only operator app start.",
-        )
+        self.events.emit("APP_START", message="Long-only operator app start.")
 
         self.rec = LongOnlyRecorder(settings, self.log_q, self.events)
 
@@ -479,9 +518,9 @@ class LongOnlyApp:
 
         btns = tk.Frame(root)
         btns.pack(fill=tk.X, padx=8, pady=4)
-        self.btn_start = tk.Button(btns, text="Start long recording", command=self.start_long)
+        self.btn_start = tk.Button(btns, text="Start long recording", command=lambda: self.start_long("ui_start_button"))
         self.btn_start.pack(side=tk.LEFT, padx=2)
-        self.btn_stop = tk.Button(btns, text="Stop long recording", command=self.stop_long)
+        self.btn_stop = tk.Button(btns, text="Stop long recording", command=lambda: self.stop_long("ui_stop_button"))
         self.btn_stop.pack(side=tk.LEFT, padx=2)
         self.btn_copy = tk.Button(btns, text="Copy log", command=self._copy_log_to_clipboard)
         self.btn_copy.pack(side=tk.LEFT, padx=2)
@@ -522,11 +561,7 @@ class LongOnlyApp:
         self._poll_log()
         self._tick()
         self._register_global_hotkeys()
-        self.events.emit(
-            "APP_READY",
-            component="app",
-            message="Long-only operator app ready.",
-        )
+        self.events.emit("APP_READY", message="Long-only operator app ready.")
 
     def _emit_ui(self, msg: str) -> None:
         ts = dt.datetime.now().strftime("%H:%M:%S")
@@ -534,87 +569,118 @@ class LongOnlyApp:
         logger.info(msg)
 
     def _state_for_event(self) -> dict[str, Any]:
+        rec = getattr(self, "rec", None)
+        recording_active = bool(rec.running()) if rec is not None else False
         return {
             "app_state": self._app_state,
-            "recording_active": self.rec.running(),
-            "recording_available": (not self._startup_blocked and not self.rec.running()),
+            "recording_active": recording_active,
+            "recording_available": (not self._startup_blocked and not recording_active),
             "restart_pending": self._restart_pending,
             "degraded": self._degraded,
         }
 
     def _log_startup_config_snapshot(self) -> None:
-        requested_size = (
+        ffprobe = resolve_ffprobe_path(self.settings)
+        req_size = (
             self.settings.uvc_dshow_video_size.strip()
             if self.settings.uvc_capture_backend == "dshow"
             else self.settings.uvc_v4l2_video_size.strip()
         )
-        requested_fps = (
+        req_fps = (
             self.settings.uvc_dshow_framerate
             if self.settings.uvc_capture_backend == "dshow"
             else self.settings.uvc_v4l2_framerate
         )
+        be = self.settings.uvc_capture_backend
+        if be == "dshow":
+            source_kind = "dshow"
+        elif be == "v4l2":
+            source_kind = "v4l2"
+        else:
+            source_kind = str(be)
         self.events.emit(
             "STARTUP_CONFIG_SNAPSHOT",
-            component="startup",
             message="Startup configuration snapshot.",
             data={
                 "ffmpeg_path": str(self.settings.ffmpeg_path),
+                "ffprobe_path": str(ffprobe) if ffprobe else None,
                 "backend": self.settings.uvc_capture_backend,
                 "device_name": self.settings.uvc_video_device,
-                "requested_video_size": requested_size,
-                "requested_video_fps": requested_fps,
-                "output_video_size": (
-                    f"{self.settings.long_output_width}x{self.settings.long_output_height}"
-                ),
-                "output_video_fps": self.settings.long_output_fps,
-                "output_path": str(self.settings.long_clips_folder),
+                "source_kind": source_kind,
+                "requested_video_size": req_size or None,
+                "requested_fps": req_fps,
+                "output_width": self.settings.long_output_width,
+                "output_height": self.settings.long_output_height,
+                "output_fps": self.settings.long_output_fps,
+                "output_codec": "libx264",
+                "container": "matroska",
                 "max_duration_seconds": self.settings.long_record_max_seconds,
+                "output_folder": str(self.settings.long_clips_folder),
+                "state_file": str(self.settings.encoder_state_path),
             },
         )
 
     def _run_startup_probe(self) -> None:
-        self.events.emit(
-            "STARTUP_PROBE_STARTED",
-            component="startup",
-            message="Startup probe started.",
-        )
+        self.events.emit("STARTUP_PROBE_STARTED", message="Startup probe started.")
         self.events.emit(
             "SOURCE_OPEN_REQUESTED",
-            component="startup",
             message="Startup source probe requested.",
             data={"device_name": self.settings.uvc_video_device},
         )
-        errors, warnings = validate_startup(self.settings)
+        errors, warnings, probe = validate_startup_detailed(self.settings)
         if errors:
             self._startup_blocked = True
             self._last_error = "; ".join(errors)
+            self._last_health_unavailable_mono = -1e9
+            err_payload: dict[str, Any] = {"errors": errors, "warnings": warnings}
+            if probe is not None:
+                err_payload["probe"] = {
+                    "exit_code": probe.exit_code,
+                    "error_kind": probe.error_kind,
+                    "stderr_tail": (probe.stderr[-800:] if probe.stderr else ""),
+                }
             self.events.emit(
                 "STARTUP_PROBE_FAILED",
-                component="startup",
                 level="ERROR",
                 message="Startup probe failed.",
-                data={"errors": errors, "warnings": warnings},
+                data=err_payload,
             )
-            self.events.emit(
-                "SOURCE_OPEN_FAILED",
-                component="startup",
-                level="ERROR",
-                message="Startup source probe failed.",
-                data={"errors": errors},
-            )
+            if probe is not None and not probe.ok:
+                self.events.emit(
+                    "SOURCE_OPEN_FAILED",
+                    level="ERROR",
+                    message="Startup source probe failed.",
+                    data={
+                        "error": {
+                            "kind": probe.error_kind or "probe_failed",
+                            "exit_code": probe.exit_code,
+                            "stderr_tail": (probe.stderr[-1200:] if probe.stderr else []),
+                        }
+                    },
+                )
             messagebox.showerror("Startup validation failed", "\n".join(errors))
         else:
+            ok_data: dict[str, Any] = {"warnings": warnings}
+            if probe is not None and probe.ok:
+                ok_data["detected_resolution"] = probe.detected_resolution
+                ok_data["detected_fps"] = probe.detected_fps
+                ok_data["detected_codec"] = probe.detected_codec
+                ok_data["probe_duration_seconds"] = round(probe.probe_duration_seconds, 3)
             self.events.emit(
                 "STARTUP_PROBE_SUCCEEDED",
-                component="startup",
                 message="Startup probe succeeded.",
-                data={"warnings": warnings},
+                data=ok_data,
             )
             self.events.emit(
                 "SOURCE_OPEN_SUCCEEDED",
-                component="startup",
                 message="Startup source probe succeeded.",
-                data={"device_name": self.settings.uvc_video_device},
+                data={
+                    "device_name": self.settings.uvc_video_device,
+                    "detected_resolution": probe.detected_resolution if probe else None,
+                    "detected_fps": probe.detected_fps if probe else None,
+                    "detected_codec": probe.detected_codec if probe else None,
+                    "probe_duration_seconds": round(probe.probe_duration_seconds, 3) if probe else None,
+                },
             )
 
     def _register_global_hotkeys(self) -> None:
@@ -634,7 +700,6 @@ class LongOnlyApp:
             self._emit_ui(msg)
             self.events.emit(
                 "HOTKEY_REGISTRATION_FAILED",
-                component="hotkeys",
                 level="ERROR",
                 message="Keyboard package missing; hotkeys unavailable.",
                 data={"error": msg},
@@ -648,16 +713,11 @@ class LongOnlyApp:
             self._emit_ui(
                 "Global hotkey registration finished (if hooks failed, install: pip install keyboard)."
             )
-            self.events.emit(
-                "HOTKEYS_ARMED",
-                component="hotkeys",
-                message="Global hotkeys armed.",
-            )
+            self.events.emit("HOTKEYS_ARMED", message="Global hotkeys armed.")
 
         def on_registered(combo: str) -> None:
             self.events.emit(
                 "HOTKEY_REGISTERED",
-                component="hotkeys",
                 message="Global hotkey registered.",
                 data={"hotkey": combo},
             )
@@ -665,7 +725,6 @@ class LongOnlyApp:
         def on_registration_failed(combo: str, err: str) -> None:
             self.events.emit(
                 "HOTKEY_REGISTRATION_FAILED",
-                component="hotkeys",
                 level="ERROR",
                 message="Global hotkey registration failed.",
                 data={"hotkey": combo, "error": err},
@@ -694,22 +753,20 @@ class LongOnlyApp:
             return
         self.events.emit(
             "HOTKEY_TRIGGERED",
-            component="hotkeys",
             message="Start long hotkey triggered.",
             data={"hotkey": self.settings.hotkey_start_long, "action": "start_long"},
         )
-        self.start_long()
+        self.start_long("hotkey_start_long")
 
     def _hotkey_stop_long(self) -> None:
         if self._shutting_down:
             return
         self.events.emit(
             "HOTKEY_TRIGGERED",
-            component="hotkeys",
             message="Stop long hotkey triggered.",
             data={"hotkey": self.settings.hotkey_stop_long, "action": "stop_long"},
         )
-        self.stop_long()
+        self.stop_long("hotkey_stop_long")
 
     def _hotkey_restart_app(self) -> None:
         if self._shutting_down:
@@ -717,15 +774,13 @@ class LongOnlyApp:
         self._emit_ui("Manual restart requested via global hotkey.")
         self.events.emit(
             "HOTKEY_TRIGGERED",
-            component="hotkeys",
             message="Restart app hotkey triggered.",
             data={"hotkey": self.settings.hotkey_restart_app, "action": "restart_app"},
         )
         self.events.emit(
             "APP_RESTART_REQUESTED",
-            component="app",
             message="App restart requested via hotkey.",
-            data={"stop_reason": "restart"},
+            data={"reason": "operator_hotkey"},
         )
         self._shutting_down = True
         self._restart_pending = True
@@ -733,18 +788,13 @@ class LongOnlyApp:
             from global_hotkeys import unregister_all_global_hotkeys_win
 
             unregister_all_global_hotkeys_win()
-        self.events.emit(
-            "HOTKEYS_UNREGISTERED",
-            component="hotkeys",
-            message="Global hotkeys unregistered.",
-        )
-        self.rec.stop(reason="restart")
+        self.events.emit("HOTKEYS_UNREGISTERED", message="Global hotkeys unregistered.")
+        self.rec.stop(reason="restart", stop_trigger_source="hotkey_restart_app")
         self._publish_state()
         self.events.emit(
             "APP_RESTART_EXITING",
-            component="app",
             message="App exiting for restart.",
-            data={"stop_reason": "restart"},
+            data={"reason": "restart"},
         )
         _flush_logger_handlers()
         self.root.destroy()
@@ -770,29 +820,36 @@ class LongOnlyApp:
             st = STATE_READY
             txt = "Recorder Ready (Long-Only)"
 
-        self._app_state = st
-        if self._prev_state != st:
+        new_app = STATE_TO_APP.get(st, st)
+        if self._prev_app_state != new_app:
+            reason = self._transition_reason_override or _infer_transition_reason(
+                self._prev_app_state, new_app
+            )
             self.events.emit(
                 "STATE_TRANSITION",
-                component="state",
-                message="State transition.",
-                data={"from_state": self._prev_state, "to_state": st},
+                message=f"State transition {self._prev_app_state} -> {new_app}",
+                data={
+                    "prev_state": self._prev_app_state or "none",
+                    "new_state": new_app,
+                    "reason": reason,
+                },
             )
-            self._prev_state = st
+            self._prev_app_state = new_app
+            self._transition_reason_override = None
+        self._app_state = new_app
 
         payload = {
             "state": st,
             "status_text": txt,
             "encoder_ready": st in (STATE_READY, STATE_RECORDING),
-            "buffer_running": False,
-            "buffer_healthy": False,
+            "rolling_buffer_applicable": False,
             "long_recording_active": self.rec.running(),
             "long_recording_available": (not self._startup_blocked and not self.rec.running()),
-            "allow_record_timer_overlay": (st == STATE_RECORDING),
             "restart_pending": self._restart_pending,
             "degraded": self._degraded,
             "auto_restart_count": 0,
             "last_error": self._last_error,
+            "long_recording_last_fault": self.rec.last_record_fault,
             "mode": "long_only",
         }
         publish_encoder_state(
@@ -800,29 +857,43 @@ class LongOnlyApp:
             payload,
             on_written=self._on_state_file_written,
         )
-        self.events.emit(
-            "STATE_SNAPSHOT",
-            component="state",
-            message="State snapshot published.",
-            data={"state_payload": payload},
-        )
 
     def _on_state_file_written(self, path: Path, payload: dict[str, Any]) -> None:
+        now = time.monotonic()
+        sig = _state_payload_signature(payload)
+        changed = self._last_state_log_sig is None or sig != self._last_state_log_sig
+        due_hb = (now - self._last_state_log_mono) >= self._state_log_heartbeat_seconds
+        if not changed and not due_hb:
+            return
+        reason = "change" if changed else "heartbeat"
+        self._last_state_log_sig = sig
+        self._last_state_log_mono = now
+        self.events.emit(
+            "STATE_SNAPSHOT",
+            message="State snapshot (JSONL).",
+            data={"state_log_reason": reason, "summary": {k: payload[k] for k in ("state", "status_text", "long_recording_active", "encoder_ready", "degraded") if k in payload}},
+        )
         self.events.emit(
             "STATE_FILE_WRITTEN",
-            component="state",
             message="Encoder state file written.",
-            data={"state_file_path": str(path), "payload": payload},
+            data={"path": str(path), "payload": payload, "state_log_reason": reason},
         )
 
-    def start_long(self) -> None:
+    def start_long(self, trigger_source: str = "ui_start_button") -> None:
         if self._startup_blocked:
+            self.rec.last_record_fault = self._last_error
             self.events.emit(
                 "LONG_RECORD_FAILED",
-                component="recorder",
                 level="ERROR",
                 message="Long recording blocked by startup validation.",
-                data={"error": self._last_error},
+                data={
+                    "error": {"kind": "startup_blocked", "detail": self._last_error},
+                    "pid": None,
+                    "output_path": None,
+                    "stop_reason": "error",
+                    "stop_method": "graceful_q",
+                    "trigger_source": trigger_source,
+                },
             )
             return
         if self.rec.running():
@@ -830,74 +901,167 @@ class LongOnlyApp:
         self._max_duration_event_emitted = False
         self._last_record_size_bytes = 0
         self._last_record_size_change_monotonic = time.monotonic()
-        if not self.rec.start():
+        if not self.rec.start(trigger_source=trigger_source):
             self._last_error = "long record failed to start"
+            self.rec.last_record_fault = self._last_error
+            self._publish_state()
+            return
+        self._transition_reason_override = "recording_started"
         self._publish_state()
+        self.events.emit(
+            "LONG_RECORD_STARTED",
+            message="Long recording session active.",
+            data={
+                "pid": self.rec._session_pid,
+                "output_path": str(self.rec.output_path) if self.rec.output_path else None,
+                "trigger_source": trigger_source,
+            },
+        )
 
-    def stop_long(self) -> None:
-        self.rec.stop(reason="operator_request")
+    def stop_long(self, trigger_source: str = "ui_stop_button") -> None:
+        if not self.rec.running():
+            return
+        self.rec.stop(reason="operator_request", stop_trigger_source=trigger_source)
+        self._finalize_stop_chain(trigger_source)
+
+    def _finalize_stop_chain(self, trigger_source: str) -> None:
         self._verify_last_output()
+        if self.rec._last_exit_data:
+            self.events.emit(
+                "LONG_RECORD_STOPPED",
+                message="Long recording session complete.",
+                data={**self.rec._last_exit_data, "stop_trigger_source": trigger_source},
+            )
+            self.rec._last_exit_data = None
+        self._transition_reason_override = "recording_stopped"
         self._publish_state()
 
     def _verify_last_output(self) -> None:
         out = self.rec.output_path
         if out is None:
             return
+        sess_pid = self.rec._last_completed_session_pid
+        base_stop = {
+            "pid": sess_pid,
+            "output_path": str(out),
+            "stop_reason": self.rec._stop_reason,
+            "stop_method": self.rec._stop_method,
+        }
         self.events.emit(
             "LONG_RECORD_VERIFICATION_STARTED",
-            component="recorder",
             message="Long record verification started.",
-            data={"output_path": str(out)},
+            data=dict(base_stop),
         )
         try:
             size = out.stat().st_size
         except OSError as e:
+            self.rec.last_record_fault = str(e)
             self.events.emit(
                 "LONG_RECORD_VERIFICATION_FAILED",
-                component="recorder",
                 level="ERROR",
                 message="Long record verification failed (stat).",
-                data={"output_path": str(out), "error": str(e)},
-            )
-            self.events.emit(
-                "LONG_RECORD_FAILED",
-                component="recorder",
-                level="ERROR",
-                message="Long record output missing after stop.",
-                data={"output_path": str(out), "error": str(e)},
-            )
-            return
-        if size < self.settings.long_record_min_bytes:
-            self.events.emit(
-                "LONG_RECORD_VERIFICATION_FAILED",
-                component="recorder",
-                level="ERROR",
-                message="Long record output too small.",
                 data={
-                    "output_path": str(out),
-                    "size_bytes": size,
-                    "min_bytes": self.settings.long_record_min_bytes,
+                    **base_stop,
+                    "error": {"kind": "stat_failed", "detail": str(e)},
                 },
             )
             self.events.emit(
                 "LONG_RECORD_FAILED",
-                component="recorder",
                 level="ERROR",
-                message="Long record output failed minimum size verification.",
-                data={"output_path": str(out), "size_bytes": size},
+                message="Long record output missing after stop.",
+                data={**base_stop, "stop_reason": "error"},
             )
             return
+        if size < self.settings.long_record_min_bytes:
+            msg = (
+                f"output too small ({size} < {self.settings.long_record_min_bytes} bytes)"
+            )
+            self.rec.last_record_fault = msg
+            self.events.emit(
+                "LONG_RECORD_VERIFICATION_FAILED",
+                level="ERROR",
+                message="Long record output too small.",
+                data={
+                    **base_stop,
+                    "error": {
+                        "kind": "file_too_small",
+                        "expected_min_bytes": self.settings.long_record_min_bytes,
+                        "actual_size_bytes": size,
+                    },
+                },
+            )
+            self.events.emit(
+                "LONG_RECORD_FAILED",
+                level="ERROR",
+                message="Long record output failed minimum size verification.",
+                data={**base_stop, "stop_reason": "error"},
+            )
+            return
+
+        ffprobe = resolve_ffprobe_path(self.settings)
+        if ffprobe is None:
+            self.rec.last_record_fault = ""
+            self.events.emit(
+                "LONG_RECORD_VERIFICATION_PASSED",
+                message="Long record verification passed (size only; ffprobe missing).",
+                data={
+                    **base_stop,
+                    "file_size_bytes": size,
+                    "duration_seconds": None,
+                    "video_codec": None,
+                    "width": None,
+                    "height": None,
+                    "avg_frame_rate": None,
+                },
+            )
+            return
+
+        rep = ffprobe_video_report(out, ffprobe)
+        if rep.error or rep.duration_seconds is None:
+            self.rec.last_record_fault = rep.error or "ffprobe incomplete"
+            self.events.emit(
+                "LONG_RECORD_VERIFICATION_FAILED",
+                level="ERROR",
+                message="Long record ffprobe verification failed.",
+                data={
+                    **base_stop,
+                    "file_size_bytes": size,
+                    "error": {"kind": "ffprobe_failed", "detail": rep.error},
+                    "actual_duration_seconds": rep.duration_seconds,
+                },
+            )
+            return
+        min_dur = max(0.5, float(self.settings.replay_export_min_duration_seconds))
+        if rep.duration_seconds < min_dur:
+            self.rec.last_record_fault = f"duration {rep.duration_seconds}s < {min_dur}s"
+            self.events.emit(
+                "LONG_RECORD_VERIFICATION_FAILED",
+                level="ERROR",
+                message="Long record duration below threshold.",
+                data={
+                    **base_stop,
+                    "file_size_bytes": size,
+                    "error": {"kind": "duration_too_short"},
+                    "expected_min_duration_seconds": min_dur,
+                    "actual_duration_seconds": rep.duration_seconds,
+                },
+            )
+            return
+
+        self.rec.last_record_fault = ""
         self.events.emit(
             "LONG_RECORD_VERIFICATION_PASSED",
-            component="recorder",
             message="Long record verification passed.",
-            data={"output_path": str(out), "size_bytes": size},
-        )
-        self.events.emit(
-            "OUTPUT_FILE_VERIFIED",
-            component="recorder",
-            message="Output file verified.",
-            data={"output_path": str(out), "size_bytes": size},
+            data={
+                **base_stop,
+                "output_path": str(out),
+                "file_size_bytes": size,
+                "duration_seconds": rep.duration_seconds,
+                "video_codec": rep.video_codec,
+                "width": rep.width,
+                "height": rep.height,
+                "avg_frame_rate": rep.avg_frame_rate,
+            },
         )
 
     def _copy_log_to_clipboard(self) -> None:
@@ -921,21 +1085,18 @@ class LongOnlyApp:
         else:
             self.status.set("Long: NOT_RECORDING")
         now = time.monotonic()
-        if now - self._last_watchdog_emit_monotonic >= self._watchdog_interval_seconds:
-            self.events.emit(
-                "WATCHDOG_TICK",
-                component="watchdog",
-                message="Watchdog tick.",
-                data={"recording_active": self.rec.running()},
-            )
-            self._last_watchdog_emit_monotonic = now
-        if self.rec.running() and now - self._last_health_emit_monotonic >= self._health_interval_seconds:
+        if self.rec.running() and now - self._last_health_check_mono >= self._health_interval_seconds:
             progress = self.rec.progress_snapshot()
+            hc_data = {
+                **progress,
+                "pid": self.rec._session_pid,
+                "output_path": str(self.rec.output_path) if self.rec.output_path else None,
+                "degraded": self._degraded,
+            }
             self.events.emit(
                 "HEALTH_CHECK",
-                component="health",
                 message="Recording health check.",
-                data=progress,
+                data=hc_data,
             )
             size = int(progress.get("output_file_size_bytes") or 0)
             if size > self._last_record_size_bytes:
@@ -945,9 +1106,8 @@ class LongOnlyApp:
                     self._degraded = False
                     self.events.emit(
                         "HEALTH_RECOVERED",
-                        component="health",
                         message="Recording health recovered.",
-                        data=progress,
+                        data=hc_data,
                     )
             elif (now - self._last_record_size_change_monotonic) > self.settings.buffer_stall_threshold_seconds:
                 if not self._degraded:
@@ -955,38 +1115,36 @@ class LongOnlyApp:
                     self._last_error = "recording progress stalled"
                     self.events.emit(
                         "HEALTH_DEGRADED",
-                        component="health",
                         level="WARNING",
                         message="Recording appears stalled.",
-                        data=progress,
+                        data=hc_data,
                     )
-            self._last_health_emit_monotonic = now
+            self._last_health_check_mono = now
             if (
                 progress["record_elapsed_seconds"] >= self.settings.long_record_max_seconds
                 and not self._max_duration_event_emitted
             ):
                 self._max_duration_event_emitted = True
                 self.events.emit(
-                    "LONG_RECORD_AUTO_STOP_TRIGGERED",
-                    component="watchdog",
-                    message="Long recording reached max duration.",
-                    data={"stop_reason": "auto_stop_max_duration", **progress},
-                )
-                self.events.emit(
                     "WATCHDOG_ACTION",
-                    component="watchdog",
-                    message="Watchdog detected auto-stop max duration.",
-                    data={"action": "observe_auto_stop", "stop_reason": "auto_stop_max_duration"},
+                    message="Watchdog: max duration observed (ffmpeg should exit).",
+                    data={
+                        "action": "observe_auto_stop",
+                        "stop_reason": "auto_stop_max_duration",
+                        "pid": self.rec._session_pid,
+                        "output_path": str(self.rec.output_path) if self.rec.output_path else None,
+                    },
                 )
-        if self._startup_blocked and now - self._last_health_emit_monotonic >= self._health_interval_seconds:
+        if self._startup_blocked and (
+            now - self._last_health_unavailable_mono >= self._state_log_heartbeat_seconds
+        ):
             self.events.emit(
                 "HEALTH_UNAVAILABLE",
-                component="health",
                 level="WARNING",
                 message="Recording unavailable due to startup block.",
                 data={"last_error": self._last_error},
             )
-            self._last_health_emit_monotonic = now
+            self._last_health_unavailable_mono = now
         self.btn_start.configure(state=tk.DISABLED if self.rec.running() or self._startup_blocked else tk.NORMAL)
         self.btn_stop.configure(state=tk.NORMAL if self.rec.running() else tk.DISABLED)
         self._publish_state()
@@ -995,34 +1153,28 @@ class LongOnlyApp:
     def on_quit(self) -> None:
         self.events.emit(
             "APP_SHUTDOWN_REQUESTED",
-            component="app",
             message="App shutdown requested.",
-            data={"stop_reason": "operator_request"},
+            data={"reason": "operator_request"},
         )
         self._shutting_down = True
         if sys.platform == "win32":
             from global_hotkeys import unregister_all_global_hotkeys_win
 
             unregister_all_global_hotkeys_win()
-        self.events.emit(
-            "HOTKEYS_UNREGISTERED",
-            component="hotkeys",
-            message="Global hotkeys unregistered.",
-        )
-        self.rec.stop(reason="operator_request")
-        self._verify_last_output()
-        self._publish_state()
-        self.events.emit(
-            "APP_SHUTDOWN_COMPLETED",
-            component="app",
-            message="App shutdown completed.",
-        )
+        self.events.emit("HOTKEYS_UNREGISTERED", message="Global hotkeys unregistered.")
+        was_running = self.rec.running()
+        self.rec.stop(reason="operator_request", stop_trigger_source="window_close")
+        if was_running:
+            self._finalize_stop_chain("window_close")
+        else:
+            self._publish_state()
+        self.events.emit("APP_SHUTDOWN_COMPLETED", message="App shutdown completed.")
         _flush_logger_handlers()
         self.root.destroy()
 
 
 def main() -> None:
-    run_id = uuid.uuid4().hex
+    run_id = new_encoder_run_id()
     try:
         settings = load_encoder_settings()
     except ValueError as e:

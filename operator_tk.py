@@ -34,7 +34,12 @@ from encoder_state import (
     STATE_UNAVAILABLE,
     publish_encoder_state,
 )
-from ffmpeg_cmd import buffer_hls_args, concat_recent_segments_args, long_record_args
+from ffmpeg_cmd import (
+    buffer_hls_args,
+    concat_recent_segments_args,
+    long_record_args,
+    long_record_config_messages,
+)
 from operator_state import (
     LongRecordState,
     ReplayControlState,
@@ -45,6 +50,7 @@ from replay_export import build_replay_plan
 from replay_verify import verify_replay_mkv
 from settings import EncoderSettings, load_encoder_settings
 from startup_validate import validate_startup
+from subprocess_win import no_console_creationflags
 
 logger = logging.getLogger("replaytrove.encoder")
 
@@ -256,6 +262,7 @@ class BufferProcess:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 text=False,
+                **no_console_creationflags(),
             )
         except OSError as e:
             self._emit_log(f"Failed to start buffer ffmpeg: {e}")
@@ -370,6 +377,9 @@ class LongRecordProcess:
                 self._on_ffmpeg_exit(-2, False, str(e))
             return False
 
+        for line in long_record_config_messages(self.settings, out):
+            self._emit_log(line)
+
         self._intentional_stop = False
         try:
             self.proc = subprocess.Popen(
@@ -378,6 +388,7 @@ class LongRecordProcess:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 text=False,
+                **no_console_creationflags(),
             )
         except OSError as e:
             self._emit_log(f"Failed to start long record: {e}")
@@ -530,6 +541,7 @@ class LongRecordProcess:
                     capture_output=True,
                     text=True,
                     timeout=60,
+                    **no_console_creationflags(),
                 )
                 if r.returncode != 0:
                     return f"ffprobe exit {r.returncode}: {(r.stderr or '')[-400:]}", False
@@ -1494,10 +1506,6 @@ class OperatorApp:
         args = [str(self.settings.ffmpeg_path)] + concat_recent_segments_args(
             self.settings, plan.concat_list_path, temp
         )
-        run_kw: dict = {}
-        if sys.platform == "win32" and hasattr(subprocess, "CREATE_NO_WINDOW"):
-            run_kw["creationflags"] = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
-
         cwd = self.settings.buffer_dir.resolve()
         try:
             r = subprocess.run(
@@ -1506,7 +1514,7 @@ class OperatorApp:
                 text=True,
                 timeout=120,
                 cwd=str(cwd),
-                **run_kw,
+                **no_console_creationflags(),
             )
         except (OSError, subprocess.TimeoutExpired) as e:
             self._emit_ui(f"Save replay ffmpeg failed: {e}")

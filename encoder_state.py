@@ -13,6 +13,11 @@ Do not infer readiness from triggers, timers, or side effects.
 * ``last_error`` — most recent fault description for operators.
 * ``long_recording_last_fault`` — last long-record capture failure (empty when none).
 
+Rolling-buffer fields (``buffer_running``, ``buffer_healthy``) are emitted only by the
+full operator that runs HLS. The long-only operator omits them and sets
+``rolling_buffer_applicable`` to false so scoreboards do not treat missing buffer
+state as an unknown condition.
+
 The file is replaced atomically so readers never see a partial JSON object.
 """
 

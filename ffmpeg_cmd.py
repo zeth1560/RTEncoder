@@ -8,6 +8,19 @@ from pathlib import Path
 
 from settings import EncoderSettings
 
+# Long-record dshow defaults (overridable via EncoderSettings / env; see settings.load_encoder_settings).
+VIDEO_DEVICE = "USB3.0 HD Video Capture"
+AUDIO_DEVICE = "Microphone (USB3.0 HD Audio Capture)"
+INPUT_FRAMERATE = "30"
+OUTPUT_FRAMERATE = "30"
+RTBUFSIZE = "512M"
+VIDEO_CODEC = "libx264"
+VIDEO_PRESET = "superfast"
+VIDEO_CRF = "23"
+PIX_FMT = "yuv420p"
+AUDIO_CODEC = "aac"
+AUDIO_BITRATE = "128k"
+
 
 def video_scale_fps_filter(width: int, height: int, fps: int) -> str:
     return f"scale={width}:{height}:flags=bicubic,fps={fps}"
@@ -146,9 +159,38 @@ def buffer_hls_args(s: EncoderSettings) -> list[str]:
     return cmd
 
 
-def long_record_args(s: EncoderSettings, output_file: Path) -> list[str]:
-    """Encode capture to Matroska; duration capped at long_record_max_seconds (-t)."""
-    output_file.parent.mkdir(parents=True, exist_ok=True)
+def long_record_config_messages(s: EncoderSettings, output_file: Path) -> list[str]:
+    """Resolved long-record options to log before spawning ffmpeg (UI + file logger)."""
+    out = str(output_file.resolve())
+    if s.uvc_capture_backend == "dshow":
+        return [
+            "Long record (dshow): starting ffmpeg with:",
+            f"  video device: {s.uvc_video_device.strip()}",
+            f"  audio device: {s.uvc_audio_device.strip()}",
+            f"  input fps: {s.long_record_input_fps.strip()}",
+            f"  output fps: {s.long_record_output_fps.strip()}",
+            f"  rtbufsize: {s.long_record_rtbufsize.strip()}",
+            f"  video: codec={s.long_record_video_codec.strip()} "
+            f"preset={s.long_record_video_preset.strip()} crf={s.long_record_video_crf}",
+            f"  pix_fmt: {s.long_record_pix_fmt.strip()}",
+            f"  audio: codec={s.long_record_audio_codec.strip()} "
+            f"bitrate={s.long_record_audio_bitrate.strip()}",
+            f"  max seconds: {s.long_record_max_seconds}",
+            f"  output path: {out}",
+        ]
+    return [
+        "Long record (v4l2): starting ffmpeg with:",
+        f"  video device: {s.uvc_video_device.strip()}",
+        f"  audio device: {s.uvc_audio_device.strip() or '(none)'}",
+        f"  output size/fps: {s.long_output_width}x{s.long_output_height} @ {s.long_output_fps}",
+        f"  video: preset={s.long_preset} crf={s.long_crf}",
+        f"  audio: aac {s.audio_bitrate_k}k",
+        f"  max seconds: {s.long_record_max_seconds}",
+        f"  output path: {out}",
+    ]
+
+
+def _long_record_args_v4l2(s: EncoderSettings, output_file: Path) -> list[str]:
     vf = video_scale_fps_filter(
         s.long_output_width,
         s.long_output_height,
@@ -189,6 +231,66 @@ def long_record_args(s: EncoderSettings, output_file: Path) -> list[str]:
         str(output_file.resolve()),
     ]
     return cmd
+
+
+def _long_record_args_dshow(s: EncoderSettings, output_file: Path) -> list[str]:
+    v = s.uvc_video_device.strip()
+    a = s.uvc_audio_device.strip()
+    if not v or not a:
+        raise ValueError(
+            "UVC_VIDEO_DEVICE and UVC_AUDIO_DEVICE are required for long recording (dshow)."
+        )
+    spec = f"video={v}:audio={a}"
+    rs = s.long_record_rtbufsize.strip()
+    if not rs:
+        raise ValueError("LONG_RECORD_RTBUFSIZE must be non-empty for long recording (dshow).")
+    in_fps = s.long_record_input_fps.strip()
+    out_fps = s.long_record_output_fps.strip()
+    # -y: overwrite output without blocking on an interactive prompt when the path exists.
+    # -rtbufsize: larger DirectShow real-time buffer to reduce "real-time buffer overflow" drops.
+    # -framerate (input) + -r (output): request 30 fps from the device and write 30 fps, avoiding
+    # a 60→30 fps filter path that can drop or duplicate frames unnecessarily.
+    cmd: list[str] = [
+        "-y",
+        "-rtbufsize",
+        rs,
+        "-f",
+        "dshow",
+        "-framerate",
+        in_fps,
+        "-i",
+        spec,
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0",
+        "-c:v",
+        s.long_record_video_codec.strip(),
+        "-preset",
+        s.long_record_video_preset.strip(),
+        "-crf",
+        str(s.long_record_video_crf),
+        "-pix_fmt",
+        s.long_record_pix_fmt.strip(),
+        "-r",
+        out_fps,
+        "-c:a",
+        s.long_record_audio_codec.strip(),
+        "-b:a",
+        s.long_record_audio_bitrate.strip(),
+        "-t",
+        str(s.long_record_max_seconds),
+        str(output_file.resolve()),
+    ]
+    return cmd
+
+
+def long_record_args(s: EncoderSettings, output_file: Path) -> list[str]:
+    """Encode capture to Matroska; duration capped at long_record_max_seconds (-t)."""
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    if s.uvc_capture_backend == "dshow":
+        return _long_record_args_dshow(s, output_file)
+    return _long_record_args_v4l2(s, output_file)
 
 
 def concat_recent_segments_args(

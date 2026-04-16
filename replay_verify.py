@@ -6,6 +6,7 @@ import subprocess
 from pathlib import Path
 
 from settings import EncoderSettings
+from subprocess_win import no_console_creationflags
 
 
 def verify_replay_mkv(path: Path, s: EncoderSettings) -> tuple[bool, str]:
@@ -47,6 +48,7 @@ def verify_replay_mkv(path: Path, s: EncoderSettings) -> tuple[bool, str]:
             capture_output=True,
             text=True,
             timeout=30,
+            **no_console_creationflags(),
         )
         if r.returncode != 0:
             return (
