@@ -1,4 +1,4 @@
-"""Pre-flight checks before starting the rolling buffer."""
+"""Pre-flight checks before starting the long-record operator."""
 
 from __future__ import annotations
 
@@ -88,16 +88,6 @@ def _probe_uvc_open_detailed(s: EncoderSettings, timeout_sec: float = 15.0) -> U
     return detail
 
 
-def _probe_uvc_open(s: EncoderSettings, timeout_sec: float = 15.0) -> tuple[bool, str]:
-    d = _probe_uvc_open_detailed(s, timeout_sec)
-    if d.ok:
-        return True, "UVC source opened (short probe ok)"
-    tail = d.stderr[-1200:] if d.stderr else "(no stderr)"
-    if d.error_kind == "timeout":
-        return False, "UVC probe timed out"
-    return False, f"UVC probe failed (exit {d.exit_code}): {tail}"
-
-
 def _dir_writable(d: Path) -> tuple[bool, str]:
     try:
         d.mkdir(parents=True, exist_ok=True)
@@ -136,32 +126,26 @@ def validate_startup_detailed(
     if not errors and s.uvc_video_device.strip():
         probe_detail = _probe_uvc_open_detailed(s)
         if not probe_detail.ok:
-            tail = probe_detail.stderr[-1200:] if probe_detail.stderr else "(no stderr)"
+            full_err = probe_detail.stderr or ""
+            tail = full_err[-1200:] if full_err else "(no stderr)"
             if probe_detail.error_kind == "timeout":
                 errors.append("UVC probe timed out")
             else:
-                errors.append(
-                    f"UVC probe failed (exit {probe_detail.exit_code}): {tail}"
-                )
+                msg = f"UVC probe failed (exit {probe_detail.exit_code}): {tail}"
+                low = full_err.lower()
+                if "could not run graph" in low or "already in use" in low:
+                    msg += (
+                        "\n\nUsually means the capture card and/or microphone is opened "
+                        "by another program (OBS, Windows Camera, a second encoder instance). "
+                        "Quit those and retry."
+                    )
+                errors.append(msg)
         else:
             warnings.append("UVC source opened (short probe ok)")
 
-    ok_ir, msg_ir = _dir_writable(s.instant_replay_path.parent)
-    if not ok_ir:
-        errors.append(f"instant_replay_path parent: {msg_ir}")
-
-    for label, path in (
-        ("buffer_dir", s.buffer_dir),
-        ("long_clips_folder", s.long_clips_folder),
-    ):
-        ok, msg = _dir_writable(path)
-        if not ok:
-            errors.append(f"{label}: {msg}")
-
-    if s.instant_replay_trigger is not None:
-        ok, msg = _dir_writable(s.instant_replay_trigger.parent)
-        if not ok:
-            errors.append(f"instant_replay_trigger parent: {msg}")
+    ok_lc, msg_lc = _dir_writable(s.long_clips_folder)
+    if not ok_lc:
+        errors.append(f"long_clips_folder: {msg_lc}")
 
     if s.long_clips_trigger is not None:
         ok, msg = _dir_writable(s.long_clips_trigger.parent)
@@ -177,8 +161,3 @@ def validate_startup_detailed(
             )
 
     return errors, warnings, probe_detail
-
-
-def validate_startup(s: EncoderSettings) -> tuple[list[str], list[str]]:
-    errs, warns, _probe = validate_startup_detailed(s)
-    return errs, warns

@@ -166,3 +166,36 @@ def ffprobe_video_report(path: Path, ffprobe: Path, *, timeout: int = 45) -> Ffp
     except (OSError, json.JSONDecodeError, subprocess.TimeoutExpired, ValueError, KeyError) as e:
         rep.error = str(e)
     return rep
+
+
+def ffprobe_has_audio_stream(path: Path, ffprobe: Path, *, timeout: int = 45) -> tuple[bool, str | None]:
+    """Return (True, None) if the file has at least one audio stream; else (False, error detail)."""
+    try:
+        r = subprocess.run(
+            [
+                str(ffprobe),
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_type,codec_name",
+                "-of",
+                "json",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            **no_console_creationflags(),
+        )
+        if r.returncode != 0:
+            tail = (r.stderr or "").strip()[-800:] or f"exit {r.returncode}"
+            return False, tail
+        blob = json.loads(r.stdout or "{}")
+        for st in blob.get("streams") or []:
+            if st.get("codec_type") == "audio":
+                return True, None
+        return False, "no audio stream in file (check UVC_AUDIO_DEVICE / mic exclusive mode)"
+    except subprocess.TimeoutExpired:
+        return False, "ffprobe timed out"
+    except (OSError, json.JSONDecodeError, ValueError) as e:
+        return False, str(e)

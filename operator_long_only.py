@@ -29,12 +29,15 @@ from encoder_state import (
     STATE_READY,
     STATE_RECORDING,
     STATE_SHUTTING_DOWN,
+    STATE_STARTING,
     STATE_UNAVAILABLE,
+    encoder_state_payload_starting,
     publish_encoder_state,
 )
-from ffmpeg_cmd import long_record_args, long_record_config_messages
+from ffmpeg_cmd import effective_uvc_input_framerate, long_record_args, long_record_config_messages
 from flight_recorder import (
     FlightJsonlEmitter,
+    ffprobe_has_audio_stream,
     ffprobe_video_report,
     new_encoder_run_id,
     parse_ffmpeg_input_stream,
@@ -47,9 +50,11 @@ from subprocess_win import no_console_creationflags
 
 logger = logging.getLogger("replaytrove.encoder")
 
+_HEALTH_STALL_ERROR = "recording progress stalled"
+
 # Encoder state constant -> flight-recorder app_state string
 STATE_TO_APP: dict[str, str] = {
-    "starting": "starting",
+    STATE_STARTING: "starting",
     STATE_BLOCKED: "blocked",
     STATE_READY: "ready",
     STATE_RECORDING: "recording",
@@ -60,6 +65,16 @@ STATE_TO_APP: dict[str, str] = {
 
 def _pretty_hotkey_combo(combo: str) -> str:
     return "+".join(p.strip().capitalize() for p in combo.split("+"))
+
+
+def _format_hms(total_sec: float) -> str:
+    """Format seconds as H:MM:SS or M:SS for status/timer display."""
+    s = max(0, int(round(total_sec)))
+    h, r = divmod(s, 3600)
+    m, sec = divmod(r, 60)
+    if h > 0:
+        return f"{h}:{m:02d}:{sec:02d}"
+    return f"{m}:{sec:02d}"
 
 
 def _flush_logger_handlers() -> None:
@@ -192,11 +207,7 @@ class LongOnlyRecorder:
             if self.settings.uvc_capture_backend == "dshow"
             else self.settings.uvc_v4l2_video_size.strip()
         )
-        req_fps = (
-            float(self.settings.long_record_input_fps)
-            if self.settings.uvc_capture_backend == "dshow"
-            else float(self.settings.uvc_v4l2_framerate)
-        )
+        req_fps = effective_uvc_input_framerate(self.settings)
         self._intentional_stop = False
         self._stop_reason = "operator_request"
         self._stop_method = "graceful_q"
@@ -239,7 +250,6 @@ class LongOnlyRecorder:
         self._start_monotonic = time.monotonic()
         try:
             out.parent.mkdir(parents=True, exist_ok=True)
-            out.touch(exist_ok=True)
         except OSError:
             pass
         self._emit(f"Long recording started (PID {self.proc.pid}) → {out}")
@@ -490,6 +500,13 @@ class LongOnlyApp:
         self._last_record_size_bytes = 0
         self._last_record_size_change_monotonic = time.monotonic()
         self._max_duration_event_emitted = False
+        # False until startup probe finishes — scoreboard sees ``starting`` instead of stale JSON.
+        self._startup_phase_complete = False
+        self._stop_sequence_lock = threading.Lock()
+        self._stop_sequence_in_progress = False
+        self._quit_pending = False
+        self._long_recording_session_seq = 0
+        self._long_recording_started_at_iso: str | None = None
 
         setup_encoder_logging(settings.encoder_log_file, ui_queue=self.log_q)
         self.events = FlightJsonlEmitter(
@@ -501,6 +518,7 @@ class LongOnlyApp:
         self.events.emit("APP_START", message="Long-only operator app start.")
 
         self.rec = LongOnlyRecorder(settings, self.log_q, self.events)
+        self._publish_state()
 
         root.title("ReplayTrove Long Recorder")
         root.geometry("760x560")
@@ -515,6 +533,17 @@ class LongOnlyApp:
         ).pack(fill=tk.X)
         self.status = tk.StringVar(value="Long: NOT_RECORDING")
         tk.Label(info, textvariable=self.status, anchor="w").pack(fill=tk.X)
+        self.rec_stats = tk.StringVar(value="—")
+        self._rec_stats_label = tk.Label(
+            info,
+            textvariable=self.rec_stats,
+            anchor="w",
+            fg="gray35",
+            font=("Segoe UI", 9),
+            wraplength=740,
+            justify=tk.LEFT,
+        )
+        self._rec_stats_label.pack(fill=tk.X)
 
         btns = tk.Frame(root)
         btns.pack(fill=tk.X, padx=8, pady=4)
@@ -557,6 +586,7 @@ class LongOnlyApp:
         self._log_startup_config_snapshot()
         self._run_startup_probe()
         self.root.protocol("WM_DELETE_WINDOW", self.on_quit)
+        self._startup_phase_complete = True
         self._publish_state()
         self._poll_log()
         self._tick()
@@ -586,11 +616,7 @@ class LongOnlyApp:
             if self.settings.uvc_capture_backend == "dshow"
             else self.settings.uvc_v4l2_video_size.strip()
         )
-        req_fps = (
-            self.settings.uvc_dshow_framerate
-            if self.settings.uvc_capture_backend == "dshow"
-            else self.settings.uvc_v4l2_framerate
-        )
+        req_fps = effective_uvc_input_framerate(self.settings)
         be = self.settings.uvc_capture_backend
         if be == "dshow":
             source_kind = "dshow"
@@ -612,7 +638,11 @@ class LongOnlyApp:
                 "output_width": self.settings.long_output_width,
                 "output_height": self.settings.long_output_height,
                 "output_fps": self.settings.long_output_fps,
-                "output_codec": "libx264",
+                "long_record_output_fps": self.settings.long_record_output_fps,
+                "long_record_encode_width": self.settings.long_record_encode_width,
+                "long_record_encode_height": self.settings.long_record_encode_height,
+                "long_record_video_codec": self.settings.long_record_video_codec,
+                "output_codec": self.settings.long_record_video_codec,
                 "container": "matroska",
                 "max_duration_seconds": self.settings.long_record_max_seconds,
                 "output_folder": str(self.settings.long_clips_folder),
@@ -804,18 +834,21 @@ class LongOnlyApp:
             logger.exception("App restart failed: %s", exc)
 
     def _publish_state(self) -> None:
-        if self._shutting_down:
+        if not self._startup_phase_complete:
+            st = STATE_STARTING
+            txt = "Recorder starting (startup checks)…"
+        elif self._shutting_down:
             st = STATE_SHUTTING_DOWN
             txt = "Recorder Shutting Down"
         elif self._startup_blocked:
             st = STATE_BLOCKED
-            txt = "Recorder Blocked"
+            txt = "Recorder blocked (startup validation failed)"
         elif self.rec.running():
             st = STATE_RECORDING
             txt = "Recorder Recording"
         elif not self.settings.uvc_video_device.strip():
             st = STATE_UNAVAILABLE
-            txt = "Recorder Unavailable"
+            txt = "Recorder unavailable (set UVC_VIDEO_DEVICE)"
         else:
             st = STATE_READY
             txt = "Recorder Ready (Long-Only)"
@@ -838,13 +871,29 @@ class LongOnlyApp:
             self._transition_reason_override = None
         self._app_state = new_app
 
+        long_recording_available = (
+            self._startup_phase_complete
+            and not self._startup_blocked
+            and not self.rec.running()
+            and bool(self.settings.uvc_video_device.strip())
+        )
+
+        if self.rec.running():
+            if self._long_recording_started_at_iso is None:
+                self._long_recording_started_at_iso = dt.datetime.now(dt.timezone.utc).isoformat()
+        else:
+            self._long_recording_started_at_iso = None
+
         payload = {
             "state": st,
             "status_text": txt,
             "encoder_ready": st in (STATE_READY, STATE_RECORDING),
+            "allow_record_timer_overlay": st in (STATE_READY, STATE_RECORDING),
             "rolling_buffer_applicable": False,
             "long_recording_active": self.rec.running(),
-            "long_recording_available": (not self._startup_blocked and not self.rec.running()),
+            "long_recording_session_seq": self._long_recording_session_seq,
+            "long_recording_started_at": self._long_recording_started_at_iso,
+            "long_recording_available": long_recording_available,
             "restart_pending": self._restart_pending,
             "degraded": self._degraded,
             "auto_restart_count": 0,
@@ -906,7 +955,9 @@ class LongOnlyApp:
             self.rec.last_record_fault = self._last_error
             self._publish_state()
             return
+        self._long_recording_session_seq += 1
         self._transition_reason_override = "recording_started"
+        self._clear_transient_health_errors()
         self._publish_state()
         self.events.emit(
             "LONG_RECORD_STARTED",
@@ -919,22 +970,54 @@ class LongOnlyApp:
         )
 
     def stop_long(self, trigger_source: str = "ui_stop_button") -> None:
-        if not self.rec.running():
-            return
-        self.rec.stop(reason="operator_request", stop_trigger_source=trigger_source)
-        self._finalize_stop_chain(trigger_source)
+        with self._stop_sequence_lock:
+            if self._stop_sequence_in_progress:
+                return
+            if not self.rec.running():
+                return
+            self._stop_sequence_in_progress = True
+        threading.Thread(
+            target=self._stop_sequence_worker,
+            args=(trigger_source, False),
+            daemon=True,
+        ).start()
 
-    def _finalize_stop_chain(self, trigger_source: str) -> None:
-        self._verify_last_output()
-        if self.rec._last_exit_data:
-            self.events.emit(
-                "LONG_RECORD_STOPPED",
-                message="Long recording session complete.",
-                data={**self.rec._last_exit_data, "stop_trigger_source": trigger_source},
+    def _stop_sequence_worker(self, trigger_source: str, quit_after: bool) -> None:
+        try:
+            self.rec.stop(reason="operator_request", stop_trigger_source=trigger_source)
+            self._verify_last_output()
+            if self.rec._last_exit_data:
+                self.events.emit(
+                    "LONG_RECORD_STOPPED",
+                    message="Long recording session complete.",
+                    data={**self.rec._last_exit_data, "stop_trigger_source": trigger_source},
+                )
+                self.rec._last_exit_data = None
+        finally:
+            self.root.after(
+                0,
+                lambda qa=quit_after: self._on_stop_sequence_complete(qa),
             )
-            self.rec._last_exit_data = None
+
+    def _on_stop_sequence_complete(self, quit_after: bool) -> None:
         self._transition_reason_override = "recording_stopped"
+        self._stop_sequence_in_progress = False
         self._publish_state()
+        if quit_after or self._quit_pending:
+            self._quit_pending = False
+            self._finalize_shutdown_ui()
+
+    def _finalize_shutdown_ui(self) -> None:
+        self.events.emit("APP_SHUTDOWN_COMPLETED", message="App shutdown completed.")
+        _flush_logger_handlers()
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
+
+    def _clear_transient_health_errors(self) -> None:
+        if self._last_error == _HEALTH_STALL_ERROR:
+            self._last_error = "—"
 
     def _verify_last_output(self) -> None:
         out = self.rec.output_path
@@ -998,9 +1081,28 @@ class LongOnlyApp:
             )
             return
 
+        if not self.settings.long_record_ffprobe_verify:
+            self.rec.last_record_fault = ""
+            self._on_verification_pass_cleanup_state()
+            self.events.emit(
+                "LONG_RECORD_VERIFICATION_PASSED",
+                message="Long record verification passed (size only; LONG_RECORD_FFPROBE_VERIFY=0).",
+                data={
+                    **base_stop,
+                    "file_size_bytes": size,
+                    "duration_seconds": None,
+                    "video_codec": None,
+                    "width": None,
+                    "height": None,
+                    "avg_frame_rate": None,
+                },
+            )
+            return
+
         ffprobe = resolve_ffprobe_path(self.settings)
         if ffprobe is None:
             self.rec.last_record_fault = ""
+            self._on_verification_pass_cleanup_state()
             self.events.emit(
                 "LONG_RECORD_VERIFICATION_PASSED",
                 message="Long record verification passed (size only; ffprobe missing).",
@@ -1031,7 +1133,7 @@ class LongOnlyApp:
                 },
             )
             return
-        min_dur = max(0.5, float(self.settings.replay_export_min_duration_seconds))
+        min_dur = float(self.settings.long_record_ffprobe_min_duration_seconds)
         if rep.duration_seconds < min_dur:
             self.rec.last_record_fault = f"duration {rep.duration_seconds}s < {min_dur}s"
             self.events.emit(
@@ -1048,7 +1150,33 @@ class LongOnlyApp:
             )
             return
 
+        has_audio, audio_err = ffprobe_has_audio_stream(out, ffprobe)
+        if not has_audio:
+            split_hint = (
+                ""
+                if self.settings.long_record_dshow_split_audio
+                else " If the mic is separate from the capture card, try LONG_RECORD_DSHOW_SPLIT_AUDIO=1."
+            )
+            self.rec.last_record_fault = (audio_err or "no audio stream") + split_hint
+            self.events.emit(
+                "LONG_RECORD_VERIFICATION_FAILED",
+                level="ERROR",
+                message="Long record output has no audio stream.",
+                data={
+                    **base_stop,
+                    "file_size_bytes": size,
+                    "error": {
+                        "kind": "no_audio_stream",
+                        "detail": audio_err,
+                        "hint": split_hint.strip() or None,
+                    },
+                    "actual_duration_seconds": rep.duration_seconds,
+                },
+            )
+            return
+
         self.rec.last_record_fault = ""
+        self._on_verification_pass_cleanup_state()
         self.events.emit(
             "LONG_RECORD_VERIFICATION_PASSED",
             message="Long record verification passed.",
@@ -1063,6 +1191,11 @@ class LongOnlyApp:
                 "avg_frame_rate": rep.avg_frame_rate,
             },
         )
+
+    def _on_verification_pass_cleanup_state(self) -> None:
+        self._clear_transient_health_errors()
+        if not self._startup_blocked:
+            self._last_error = "—"
 
     def _copy_log_to_clipboard(self) -> None:
         text = self.log_widget.get("1.0", tk.END)
@@ -1079,14 +1212,61 @@ class LongOnlyApp:
             pass
         self.root.after(200, self._poll_log)
 
+    def _recording_stats_display(self, snap: dict[str, Any]) -> tuple[str, str]:
+        """Human-readable ffmpeg progress + a text color hint when throughput lags realtime."""
+        fps_p = snap.get("last_ffmpeg_progress_fps")
+        spd = snap.get("last_ffmpeg_progress_speed")
+        tgt_s = self.settings.long_record_output_fps.strip()
+        try:
+            tgt = float(tgt_s)
+        except ValueError:
+            tgt = None
+
+        parts: list[str] = []
+        if fps_p is not None:
+            parts.append(f"encode {fps_p:.1f} fps")
+        if tgt is not None:
+            parts.append(f"target {tgt:g} fps")
+        if fps_p is not None and tgt is not None:
+            parts.append(f"Δ {fps_p - tgt:+.1f}")
+        br = snap.get("last_ffmpeg_progress_bitrate_kbps")
+        if isinstance(br, (int, float)) and br >= 0:
+            parts.append(f"{br:.0f} kbps")
+        if spd is not None:
+            parts.append(f"{spd:.2f}x realtime")
+
+        if not parts:
+            return ("Waiting for ffmpeg throughput stats (first few seconds)…", "gray45")
+
+        fg = "gray15"
+        if spd is not None:
+            if spd < 0.92:
+                fg = "#b91c1c"
+            elif spd < 0.98:
+                fg = "#c2410c"
+            elif spd < 1.0:
+                fg = "#a16207"
+        return ("Throughput: " + " · ".join(parts), fg)
+
     def _tick(self) -> None:
-        if self.rec.running():
-            self.status.set(f"Long: RECORDING → {self.rec.output_path}")
+        snap = self.rec.progress_snapshot() if self.rec.running() else None
+        if snap is not None:
+            elapsed = float(snap.get("record_elapsed_seconds") or 0)
+            mx = float(self.settings.long_record_max_seconds)
+            self.status.set(
+                "Long: RECORDING  "
+                f"[{_format_hms(elapsed)} / {_format_hms(mx)}]  →  {self.rec.output_path}"
+            )
+            txt, fg = self._recording_stats_display(snap)
+            self.rec_stats.set(txt)
+            self._rec_stats_label.configure(fg=fg)
         else:
             self.status.set("Long: NOT_RECORDING")
+            self.rec_stats.set("—")
+            self._rec_stats_label.configure(fg="gray35")
         now = time.monotonic()
-        if self.rec.running() and now - self._last_health_check_mono >= self._health_interval_seconds:
-            progress = self.rec.progress_snapshot()
+        if snap is not None and now - self._last_health_check_mono >= self._health_interval_seconds:
+            progress = snap
             hc_data = {
                 **progress,
                 "pid": self.rec._session_pid,
@@ -1104,15 +1284,16 @@ class LongOnlyApp:
                 self._last_record_size_change_monotonic = now
                 if self._degraded:
                     self._degraded = False
+                    self._clear_transient_health_errors()
                     self.events.emit(
                         "HEALTH_RECOVERED",
                         message="Recording health recovered.",
                         data=hc_data,
                     )
-            elif (now - self._last_record_size_change_monotonic) > self.settings.buffer_stall_threshold_seconds:
+            elif (now - self._last_record_size_change_monotonic) > self.settings.long_record_stall_threshold_seconds:
                 if not self._degraded:
                     self._degraded = True
-                    self._last_error = "recording progress stalled"
+                    self._last_error = _HEALTH_STALL_ERROR
                     self.events.emit(
                         "HEALTH_DEGRADED",
                         level="WARNING",
@@ -1145,7 +1326,11 @@ class LongOnlyApp:
                 data={"last_error": self._last_error},
             )
             self._last_health_unavailable_mono = now
-        self.btn_start.configure(state=tk.DISABLED if self.rec.running() or self._startup_blocked else tk.NORMAL)
+        self.btn_start.configure(
+            state=tk.DISABLED
+            if self.rec.running() or self._startup_blocked or self._stop_sequence_in_progress
+            else tk.NORMAL
+        )
         self.btn_stop.configure(state=tk.NORMAL if self.rec.running() else tk.DISABLED)
         self._publish_state()
         self.root.after(1000, self._tick)
@@ -1162,15 +1347,23 @@ class LongOnlyApp:
 
             unregister_all_global_hotkeys_win()
         self.events.emit("HOTKEYS_UNREGISTERED", message="Global hotkeys unregistered.")
-        was_running = self.rec.running()
-        self.rec.stop(reason="operator_request", stop_trigger_source="window_close")
-        if was_running:
-            self._finalize_stop_chain("window_close")
-        else:
-            self._publish_state()
-        self.events.emit("APP_SHUTDOWN_COMPLETED", message="App shutdown completed.")
-        _flush_logger_handlers()
-        self.root.destroy()
+        running = False
+        with self._stop_sequence_lock:
+            if self._stop_sequence_in_progress:
+                self._quit_pending = True
+                return
+            running = self.rec.running()
+            if running:
+                self._stop_sequence_in_progress = True
+        if running:
+            threading.Thread(
+                target=self._stop_sequence_worker,
+                args=("window_close", True),
+                daemon=True,
+            ).start()
+            return
+        self._publish_state()
+        self._finalize_shutdown_ui()
 
 
 def main() -> None:
@@ -1180,6 +1373,11 @@ def main() -> None:
     except ValueError as e:
         print(e, file=sys.stderr)
         raise SystemExit(1)
+
+    publish_encoder_state(
+        settings.encoder_state_path,
+        encoder_state_payload_starting(),
+    )
 
     root = tk.Tk()
     LongOnlyApp(root, settings, run_id)
