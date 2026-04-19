@@ -53,6 +53,20 @@ def _dshow_i_combined(video_dev: str, audio_dev: str) -> str:
     return f"{_dshow_i_video(video_dev)}:{_dshow_i_audio(audio_dev)}"
 
 
+def _long_record_audio_filter(s: EncoderSettings) -> str | None:
+    """Optional audio filter chain for long-record (aresample drift + fixed sync offset)."""
+    parts: list[str] = []
+    if s.uvc_capture_backend == "dshow" and s.long_record_audio_aresample_async_max > 0:
+        parts.append(
+            f"aresample=async={s.long_record_audio_aresample_async_max}:first_pts=0:osr=48000"
+        )
+    if s.long_record_audio_sync_offset_ms != 0:
+        sec = s.long_record_audio_sync_offset_ms / 1000.0
+        # Positive ms → advance audio (subtract PTS) when sound lags behind video.
+        parts.append(f"asetpts=PTS-({sec})/TB")
+    return ",".join(parts) if parts else None
+
+
 def _long_record_dshow_vf(s: EncoderSettings) -> str | None:
     """
     Downscale + fps for long-record dshow encode. Capture can stay 1080p60; this reduces
@@ -199,6 +213,7 @@ def long_record_config_messages(s: EncoderSettings, output_file: Path) -> list[s
             f"  pix_fmt: {s.long_record_pix_fmt.strip()}",
             f"  audio: codec={s.long_record_audio_codec.strip()} "
             f"bitrate={s.long_record_audio_bitrate.strip()}",
+            f"  audio sync offset ms (+ = advance audio): {s.long_record_audio_sync_offset_ms}",
             f"  audio aresample async (0=off): {s.long_record_audio_aresample_async_max}",
             f"  thread_queue_size (0=default): {s.long_record_thread_queue_size}",
             f"  max_muxing_queue_size (0=default): {s.long_record_max_muxing_queue_size}",
@@ -213,7 +228,8 @@ def long_record_config_messages(s: EncoderSettings, output_file: Path) -> list[s
         f"  audio device: {s.uvc_audio_device.strip() or '(none)'}",
         f"  output size/fps: {s.long_output_width}x{s.long_output_height} @ {s.long_output_fps}",
         f"  video: preset={s.long_preset} crf={s.long_crf}",
-        f"  audio: aac {s.audio_bitrate_k}k",
+        f"  audio: aac {s.audio_bitrate_k}k "
+        f"(sync offset ms: {s.long_record_audio_sync_offset_ms})",
         f"  max seconds: {s.long_record_max_seconds}",
         f"  output path: {out}",
     ]
@@ -229,6 +245,9 @@ def _long_record_args_v4l2(s: EncoderSettings, output_file: Path) -> list[str]:
 
     cmd: list[str] = uvc_input_args(s)
     cmd += uvc_encode_maps(s)
+    af = _long_record_audio_filter(s)
+    if af:
+        cmd += ["-af", af]
     cmd += [
         "-t",
         str(s.long_record_max_seconds),
@@ -318,11 +337,10 @@ def _long_record_args_dshow(s: EncoderSettings, output_file: Path) -> list[str]:
     ]
     # Stretch/trim audio to track video PTS when capture-card vs mic clocks drift (growing A/V skew).
     # osr=48000 normalizes USB mics (often 44.1 kHz) for AAC; -ar/-ac reinforce the output track.
-    if s.long_record_audio_aresample_async_max > 0:
-        cmd += [
-            "-af",
-            f"aresample=async={s.long_record_audio_aresample_async_max}:first_pts=0:osr=48000",
-        ]
+    # Optional asetpts offset advances or delays audio vs video (LONG_RECORD_AUDIO_SYNC_OFFSET_MS).
+    af = _long_record_audio_filter(s)
+    if af:
+        cmd += ["-af", af]
     cmd += [
         "-ar",
         "48000",
