@@ -90,6 +90,7 @@ class EncoderSettings:
     long_record_nvenc_tune: str
     long_record_audio_codec: str
     long_record_audio_bitrate: str
+    long_record_audio_sample_rate: int
     long_record_audio_sync_offset_ms: int
     long_record_audio_aresample_async_max: int
     long_record_thread_queue_size: int
@@ -178,6 +179,11 @@ def load_encoder_settings() -> EncoderSettings:
         long_record_nvenc_tune=_opt("LONG_RECORD_NVENC_TUNE", "ll"),
         long_record_audio_codec=_opt("LONG_RECORD_AUDIO_CODEC", "aac"),
         long_record_audio_bitrate=_opt("LONG_RECORD_AUDIO_BITRATE", "128k"),
+        long_record_audio_sample_rate=_opt_int(
+            "LONG_RECORD_AUDIO_SAMPLE_RATE",
+            44100,
+            1,
+        ),
         long_record_audio_sync_offset_ms=_opt_int(
             "LONG_RECORD_AUDIO_SYNC_OFFSET_MS",
             0,

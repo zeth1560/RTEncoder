@@ -7,6 +7,7 @@ This mode records long clips only (using LONG_RECORD_* settings).
 
 from __future__ import annotations
 
+import codecs
 import datetime as dt
 import json
 import logging
@@ -51,6 +52,102 @@ from subprocess_win import no_console_creationflags
 logger = logging.getLogger("replaytrove.encoder")
 
 _HEALTH_STALL_ERROR = "recording progress stalled"
+
+# Throttle noisy ffmpeg `\r` progress spam at DEBUG; snapshots use INFO on a wall-clock interval.
+_FFMPEG_PROGRESS_SNAPSHOT_INTERVAL_SEC = 30.0
+_FFMPEG_PROGRESS_DEBUG_THROTTLE_SEC = 1.5
+
+_FFMPEG_STDERR_WARN_SUBSTRINGS: tuple[str, ...] = (
+    "thread message queue blocking",
+    "non-monotonous dts",
+    "non-monotonic dts",
+    "non monotonous dts",
+    "queue input is backward in time",
+    "past duration too large",
+    "buffer overrun",
+    "buffer underrun",
+    "real-time buffer overflow",
+    "dropped samples",
+    "timestamp discontinuity",
+    "error submitting packet to the muxer",
+    "error while filtering",
+    "error encoding audio",
+    "failed to inject audio",
+    "residual on audio",
+)
+
+
+def _ffmpeg_stderr_extra_warning(line_lower: str) -> bool:
+    if any(s in line_lower for s in _FFMPEG_STDERR_WARN_SUBSTRINGS):
+        return True
+    if "aac" in line_lower and any(
+        w in line_lower for w in ("error", "failed", "invalid", "not supported")
+    ):
+        return True
+    if "audio" in line_lower and "failed" in line_lower:
+        return True
+    return False
+
+
+def _split_buffered_stderr_text(buf: str) -> tuple[list[str], str]:
+    """Split decoded stderr into complete logical lines (handles `\\n` and ffmpeg `\\r` progress)."""
+    lines_out: list[str] = []
+    while True:
+        if "\n" in buf:
+            raw, buf = buf.split("\n", 1)
+            for piece in raw.split("\r"):
+                t = piece.strip()
+                if t:
+                    lines_out.append(t)
+            continue
+        if "\r" in buf:
+            idx = buf.index("\r")
+            pre = buf[:idx]
+            buf = buf[idx + 1 :]
+            t = pre.strip()
+            if t:
+                lines_out.append(t)
+            continue
+        break
+    return lines_out, buf
+
+
+def _parse_ffmpeg_progress_line(line: str) -> dict[str, Any] | None:
+    """Parse ffmpeg status lines that start with ``frame=`` (best-effort)."""
+    s = line.strip()
+    if not s.startswith("frame="):
+        return None
+    out: dict[str, Any] = {}
+    patterns = (
+        (r"\bframe=\s*(?P<v>\d+)", "frame", int),
+        (r"\bfps=\s*(?P<v>[0-9.]+)", "fps", float),
+        (r"\bbitrate=\s*(?P<v>[0-9.]+)\s*kbits/s", "bitrate_kbps", float),
+        (r"\bspeed=\s*(?P<v>[0-9.]+)\s*x", "speed", float),
+        (r"\bdup=\s*(?P<v>\d+)", "dup", int),
+        (r"\bdrop=\s*(?P<v>\d+)", "drop", int),
+        (r"\btime=(?P<v>\d+:\d+:\d+\.\d+|\d+:\d+:\d+)", "time", str),
+    )
+    for pat, key, typ in patterns:
+        m = re.search(pat, s)
+        if not m:
+            continue
+        rawv = m.group("v")
+        if typ is str:
+            out[key] = rawv
+        else:
+            try:
+                out[key] = typ(rawv)
+            except ValueError:
+                out[key] = rawv
+    if not any(k in out for k in ("fps", "speed", "frame", "bitrate_kbps")):
+        return None
+    return out
+
+
+def _fmt_snap_val(v: Any) -> str:
+    if v is None:
+        return "n/a"
+    return str(v)
 
 # Encoder state constant -> flight-recorder app_state string
 STATE_TO_APP: dict[str, str] = {
@@ -112,10 +209,6 @@ def _infer_transition_reason(prev: str | None, new: str) -> str:
 
 
 class LongOnlyRecorder:
-    _PROGRESS_RE = re.compile(
-        r"fps=\s*(?P<fps>[0-9.]+).*?bitrate=\s*(?P<bitrate>[0-9.]+)kbits/s.*?speed=\s*(?P<speed>[0-9.]+)x"
-    )
-
     def __init__(
         self,
         settings: EncoderSettings,
@@ -136,6 +229,12 @@ class LongOnlyRecorder:
         self._last_fps: float | None = None
         self._last_speed: float | None = None
         self._last_bitrate_kbps: float | None = None
+        self._last_progress_frame: int | None = None
+        self._last_dup: int | None = None
+        self._last_drop: int | None = None
+        self._last_encoded_time_str: str | None = None
+        self._last_progress_debug_monotonic: float = 0.0
+        self._last_progress_snapshot_at_monotonic: float | None = None
         self._stderr_tail: deque[str] = deque(maxlen=80)
         self._input_opened = False
         self._output_opened = False
@@ -170,6 +269,90 @@ class LongOnlyRecorder:
 
     def running(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
+
+    def _maybe_emit_periodic_progress_snapshot(self) -> None:
+        if self._start_monotonic is None:
+            return
+        now = time.monotonic()
+        elapsed = now - self._start_monotonic
+        if elapsed < _FFMPEG_PROGRESS_SNAPSHOT_INTERVAL_SEC:
+            return
+        ref = self._last_progress_snapshot_at_monotonic
+        if ref is not None and (now - ref) < _FFMPEG_PROGRESS_SNAPSHOT_INTERVAL_SEC:
+            return
+        self._last_progress_snapshot_at_monotonic = now
+        rec_elapsed = round(elapsed, 1)
+        spd = f"{self._last_speed}x" if self._last_speed is not None else "n/a"
+        logger.info(
+            "long_record ffmpeg progress snapshot: record_elapsed_s=%s encoded_time=%s frame=%s "
+            "fps=%s speed=%s dup=%s drop=%s bitrate_kbps=%s",
+            rec_elapsed,
+            _fmt_snap_val(self._last_encoded_time_str),
+            _fmt_snap_val(self._last_progress_frame),
+            _fmt_snap_val(self._last_fps),
+            spd,
+            _fmt_snap_val(self._last_dup),
+            _fmt_snap_val(self._last_drop),
+            _fmt_snap_val(self._last_bitrate_kbps),
+        )
+
+    def _handle_ffmpeg_stderr_line(self, line: str) -> None:
+        line = line.strip()
+        if not line:
+            return
+        self._stderr_tail.append(line)
+        low = line.lower()
+        prog = _parse_ffmpeg_progress_line(line)
+        if prog is not None:
+            if "frame" in prog:
+                self._last_progress_frame = prog["frame"]
+            if "fps" in prog:
+                self._last_fps = prog["fps"]
+            if "bitrate_kbps" in prog:
+                self._last_bitrate_kbps = prog["bitrate_kbps"]
+            if "speed" in prog:
+                self._last_speed = prog["speed"]
+            if "dup" in prog:
+                self._last_dup = prog["dup"]
+            if "drop" in prog:
+                self._last_drop = prog["drop"]
+            if "time" in prog:
+                self._last_encoded_time_str = str(prog["time"])
+        extra_warn = _ffmpeg_stderr_extra_warning(low)
+        err_fail = "error" in low or "failed" in low
+        should_debug = True
+        if low.startswith("frame=") and not err_fail and not extra_warn:
+            qn = time.monotonic()
+            if qn - self._last_progress_debug_monotonic < _FFMPEG_PROGRESS_DEBUG_THROTTLE_SEC:
+                should_debug = False
+            else:
+                self._last_progress_debug_monotonic = qn
+        if should_debug:
+            logger.debug("[long stderr] %s", line)
+        if err_fail or extra_warn:
+            logger.warning("[long stderr] %s", line)
+        if not self._input_opened and "input #0" in low:
+            self._input_opened = True
+            blob = parse_ffmpeg_input_stream("\n".join(self._stderr_tail))
+            self.events.emit(
+                "FFMPEG_CHILD_STDERR_SUMMARY",
+                message="ffmpeg input opened.",
+                data={
+                    "phase": "input_opened",
+                    "input_format": blob.get("input_format"),
+                    "device_name": blob.get("device_name"),
+                    "detected_codec": blob.get("detected_codec"),
+                    "detected_resolution": blob.get("detected_resolution"),
+                    "detected_fps": blob.get("detected_fps"),
+                },
+            )
+        if not self._output_opened and "output #0" in low:
+            self._output_opened = True
+            self.events.emit(
+                "FFMPEG_CHILD_STDERR_SUMMARY",
+                message="ffmpeg output initialized.",
+                data={"phase": "output_initialized", "stderr_line": line[:500]},
+            )
 
     def start(self, *, trigger_source: str) -> bool:
         self.stop(reason="operator_request", stop_trigger_source="preempt_new_session")
@@ -214,6 +397,12 @@ class LongOnlyRecorder:
         self._last_fps = None
         self._last_speed = None
         self._last_bitrate_kbps = None
+        self._last_progress_frame = None
+        self._last_dup = None
+        self._last_drop = None
+        self._last_encoded_time_str = None
+        self._last_progress_debug_monotonic = 0.0
+        self._last_progress_snapshot_at_monotonic = None
         self._stderr_tail.clear()
         self._input_opened = False
         self._output_opened = False
@@ -276,46 +465,33 @@ class LongOnlyRecorder:
 
         def drain_stderr() -> None:
             assert proc_ref.stderr
-            for raw in proc_ref.stderr:
-                line = raw.decode(errors="replace").rstrip()
-                if not line:
-                    continue
-                self._stderr_tail.append(line)
-                low = line.lower()
-                if "error" in low or "failed" in low:
-                    logger.warning("[long stderr] %s", line)
-                else:
-                    logger.debug("[long stderr] %s", line)
-                if not self._input_opened and "input #0" in low:
-                    self._input_opened = True
-                    blob = parse_ffmpeg_input_stream("\n".join(self._stderr_tail))
-                    self.events.emit(
-                        "FFMPEG_CHILD_STDERR_SUMMARY",
-                        message="ffmpeg input opened.",
-                        data={
-                            "phase": "input_opened",
-                            "input_format": blob.get("input_format"),
-                            "device_name": blob.get("device_name"),
-                            "detected_codec": blob.get("detected_codec"),
-                            "detected_resolution": blob.get("detected_resolution"),
-                            "detected_fps": blob.get("detected_fps"),
-                        },
-                    )
-                if not self._output_opened and "output #0" in low:
-                    self._output_opened = True
-                    self.events.emit(
-                        "FFMPEG_CHILD_STDERR_SUMMARY",
-                        message="ffmpeg output initialized.",
-                        data={"phase": "output_initialized", "stderr_line": line[:500]},
-                    )
-                m = self._PROGRESS_RE.search(line)
-                if m:
-                    try:
-                        self._last_fps = float(m.group("fps"))
-                        self._last_bitrate_kbps = float(m.group("bitrate"))
-                        self._last_speed = float(m.group("speed"))
-                    except ValueError:
-                        pass
+            dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
+            text_buf = ""
+            raw_stderr = proc_ref.stderr
+            try:
+                while True:
+                    block = raw_stderr.read(8192)
+                    if not block:
+                        break
+                    text_buf += dec.decode(block)
+                    while True:
+                        lines, text_buf = _split_buffered_stderr_text(text_buf)
+                        if not lines:
+                            break
+                        for ln in lines:
+                            self._handle_ffmpeg_stderr_line(ln)
+                    self._maybe_emit_periodic_progress_snapshot()
+                text_buf += dec.decode(b"", final=True)
+            finally:
+                while True:
+                    lines, text_buf = _split_buffered_stderr_text(text_buf)
+                    if not lines:
+                        break
+                    for ln in lines:
+                        self._handle_ffmpeg_stderr_line(ln)
+                if text_buf.strip():
+                    self._handle_ffmpeg_stderr_line(text_buf.strip())
+                self._maybe_emit_periodic_progress_snapshot()
 
         def reaper() -> None:
             child_pid = proc_ref.pid

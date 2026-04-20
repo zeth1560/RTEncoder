@@ -139,6 +139,12 @@ def validate_startup_detailed(
                         "by another program (OBS, Windows Camera, a second encoder instance). "
                         "Quit those and retry."
                     )
+                if "could not set video options" in low:
+                    msg += (
+                        "\n\nOften the capture rate does not match the device (e.g. a webcam "
+                        "may need 30 fps while an HDMI dongle uses 60). Set UVC_DSHOW_FRAMERATE "
+                        "to a supported rate and align LONG_RECORD_INPUT_FRAMERATE (try 30)."
+                    )
                 errors.append(msg)
         else:
             warnings.append("UVC source opened (short probe ok)")
